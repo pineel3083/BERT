@@ -15,19 +15,20 @@ MNLI_CHECKPOINT = "textattack/bert-base-uncased-MNLI"
 GLUE_DATASET_REPO = "nyu-mll/glue"
 BW_B = [22, 22, 20, 18, 16, 16, 14, 12]
 BW_E = [28, 24, 22, 20, 18, 16, 14, 10]
+TRACK_NAME = "task_level_hf_checkpoint_trend"
 
 PRESET_HELP = """
 Recommended experiment presets:
 
-A. Padded workload case:
+A. Paper-like padded workload case:
    python eval_glue_tpdcim.py --tasks mnli --max-examples 512 --batch-size 4 --max-length 512 --tile-n 64
-   Expected: num_blocks=8, sparse density=0.53125, skipped tiles may be mostly padding for GLUE.
+   Expected: num_blocks=8, padded sparse density=0.53125, skipped tiles may be mostly padding for GLUE.
 
-B. Real-token stress case:
+B. Scaled real-token stress case:
    python eval_glue_tpdcim.py --tasks mnli --max-examples 512 --batch-size 4 --max-length 128 --tile-n 16
-   Expected: num_blocks=8, sparse density=0.53125, real tokens span more blocks.
+   Expected: num_blocks=8, real tokens span more blocks, sparse may affect real-token attention.
 
-C. More aggressive sparse stress case:
+C. Aggressive diagnostic case:
    python eval_glue_tpdcim.py --tasks mnli --max-examples 512 --batch-size 4 --max-length 128 --tile-n 8
    Expected: num_blocks=16, stronger sparse pressure on real-token attention.
 """
@@ -79,7 +80,6 @@ TASKS = {
         "dataset_name": "mrpc",
         "split": "validation",
         "text_columns": ("sentence1", "sentence2"),
-        "metric_names": ("accuracy", "f1"),
         "primary_metric": "f1",
         "prediction_label_map": None,
     },
@@ -88,7 +88,6 @@ TASKS = {
         "dataset_name": "mnli",
         "split": "validation_matched",
         "text_columns": ("premise", "hypothesis"),
-        "metric_names": ("accuracy",),
         "primary_metric": "accuracy",
         # TextAttack MNLI logits follow the old Transformers GLUE order:
         # contradiction, entailment, neutral. HF GLUE ids are:
@@ -125,11 +124,7 @@ def ceil_div(value, divisor):
 
 
 def load_glue_split(dataset_name, split):
-    """Load GLUE from its canonical HF dataset repo.
-
-    Some datasets/huggingface_hub versions no longer resolve the historical
-    short name `glue` cleanly, so prefer the namespace-qualified repo id.
-    """
+    """Load GLUE from its canonical HF dataset repo."""
     return load_dataset(GLUE_DATASET_REPO, dataset_name, split=split)
 
 
@@ -215,12 +210,7 @@ def empty_sparse_real_token_stats():
 
 
 def compute_sparse_real_token_stats(dataset, args, num_layers):
-    """Count sparse skipped tiles against sample-level real-token blocks.
-
-    Existing QK counters use padded sequence block positions. These diagnostics
-    instead count each sample's real-token block pairs, then scale by layers.
-    They are hardware-oriented activity proxies, not CUDA speed or energy data.
-    """
+    """Count sparse skipped tiles against sample-level real-token blocks."""
     num_blocks = ceil_div(args.max_length, args.tile_n)
     block_mask = make_sparse_block_mask(
         num_blocks=num_blocks,
@@ -279,8 +269,8 @@ def compute_sparse_real_token_stats(dataset, args, num_layers):
 
 def print_experiment_presets():
     print("Preset hints:")
-    print("  padded workload: --max-length 512 --tile-n 64")
-    print("  real-token stress: --max-length 128 --tile-n 16")
+    print("  paper-like padded workload: --max-length 512 --tile-n 64")
+    print("  scaled real-token stress: --max-length 128 --tile-n 16")
     print("  aggressive sparse stress: --max-length 128 --tile-n 8")
 
 
@@ -473,6 +463,42 @@ def evaluate_case(task_name, task_cfg, dataset, case, args):
     return metrics, stats, logits, predictions
 
 
+def format_reduction(value):
+    if value is None:
+        return "-"
+    return f"x{value:.3f}"
+
+
+def compute_activity_metrics(case, stats):
+    density = stats["qk_sparse_density"]
+    tcs_keep_ratio = 1.0 - stats["tcs_row_skip_ratio"]
+
+    if not case.enable_patch or not case.enable_sparse:
+        reduction_dense = 1.0
+        reduction_bigbird = None
+        saving_dense = 0.0
+        saving_bigbird = None
+    elif case.enable_tcs:
+        reduction_dense = density * tcs_keep_ratio
+        reduction_bigbird = tcs_keep_ratio
+        saving_dense = 1.0 - reduction_dense
+        saving_bigbird = 1.0 - reduction_bigbird
+    else:
+        reduction_dense = density
+        reduction_bigbird = 1.0
+        saving_dense = 1.0 - reduction_dense
+        saving_bigbird = 0.0
+
+    return {
+        "computation_reduction_vs_dense": reduction_dense,
+        "reduction_vs_dense_str": format_reduction(reduction_dense),
+        "operation_saving_vs_dense": saving_dense,
+        "computation_reduction_vs_bigbird": reduction_bigbird,
+        "reduction_vs_bigbird_str": format_reduction(reduction_bigbird),
+        "operation_saving_vs_bigbird": saving_bigbird,
+    }
+
+
 def fmt_float(value, digits=6):
     if value is None:
         return "-"
@@ -491,7 +517,13 @@ def fmt_cell(value, digits=6):
 
 def print_table(rows):
     headers = [
+        "track",
         "task",
+        "model_name",
+        "split",
+        "max_length",
+        "tile_n",
+        "num_blocks",
         "case",
         "accuracy",
         "f1",
@@ -505,9 +537,21 @@ def print_table(rows):
         "qk_computed_tiles",
         "qk_skipped_tiles",
         "qk_sparse_density",
+        "padded_qk_sparse_density",
         "qk_tile_skip_ratio",
+        "padded_qk_tile_skip_ratio",
+        "real_qk_sparse_density",
+        "real_qk_tile_skip_ratio",
         "bit_ops_total",
+        "tcs_rows_total",
+        "tcs_rows_skipped",
         "tcs_row_skip_ratio",
+        "computation_reduction_vs_dense",
+        "reduction_vs_dense_str",
+        "operation_saving_vs_dense",
+        "computation_reduction_vs_bigbird",
+        "reduction_vs_bigbird_str",
+        "operation_saving_vs_bigbird",
         "min_nonpad_tokens",
         "mean_nonpad_tokens",
         "max_nonpad_tokens",
@@ -519,19 +563,70 @@ def print_table(rows):
         "skipped_tile_padding_ratio",
         "skipped_tile_real_ratio",
         "skipped_tiles_mostly_padding",
-        "real_qk_total_tiles",
-        "real_qk_computed_tiles",
-        "real_qk_skipped_tiles",
-        "real_qk_sparse_density",
-        "real_qk_tile_skip_ratio",
     ]
     print("\n" + "=" * 120)
-    print("FINAL GLUE TPDCIM SUMMARY")
+    print("FINAL GLUE TPDCIM DETAILED SUMMARY")
     print("=" * 120)
     print(" | ".join(headers))
     print(" | ".join("-" * len(h) for h in headers))
     for row in rows:
         print(" | ".join(fmt_cell(row.get(header)) for header in headers))
+
+
+def compact_method(case_name):
+    if case_name == "baseline":
+        return "Software baseline"
+    if case_name == "sparse_bitserial":
+        return "BigBird proxy"
+    if case_name == "sparse_bitserial_tcs_bw_B":
+        return "Prop proxy bw_B"
+    if case_name == "sparse_bitserial_tcs_bw_E":
+        return "Prop proxy bw_E"
+    return None
+
+
+def print_compact_table(rows):
+    headers = [
+        "Task",
+        "Setting",
+        "Method",
+        "Metric",
+        "Score",
+        "Delta",
+        "Reduction vs Dense",
+        "Reduction vs BigBird",
+        "Real-token skip ratio",
+    ]
+    print("\n" + "=" * 120)
+    print("COMPACT TABLE-1-STYLE TREND SUMMARY")
+    print("=" * 120)
+    print("Note: these are HF checkpoint trend numbers and operation/activity proxies, not exact paper reproduction.")
+    print(" | ".join(headers))
+    print(" | ".join("-" * len(h) for h in headers))
+
+    for row in rows:
+        method = compact_method(row["case"])
+        if method is None:
+            continue
+        metric = row["primary_metric"]
+        score = row[metric]
+        delta = row[f"{metric}_delta"]
+        setting = f"max_length={row['max_length']},tile_n={row['tile_n']}"
+        print(
+            " | ".join(
+                [
+                    row["task"],
+                    setting,
+                    method,
+                    metric,
+                    fmt_float(score, 4),
+                    fmt_float(delta, 4),
+                    row["reduction_vs_dense_str"],
+                    row["reduction_vs_bigbird_str"],
+                    fmt_float(row["real_qk_tile_skip_ratio"], 4),
+                ]
+            )
+        )
 
 
 def run_equivalence_checks(task_name, logits_by_case):
@@ -550,10 +645,13 @@ def run_equivalence_checks(task_name, logits_by_case):
 
 def main():
     args = parse_args()
+    num_blocks = ceil_div(args.max_length, args.tile_n)
+    print("track:", TRACK_NAME)
     print("device:", args.device)
     print("batch_size:", args.batch_size)
     print("max_length:", args.max_length)
     print("tile_n:", args.tile_n)
+    print("num_blocks:", num_blocks)
     print("local_window:", args.local_window)
     print("max_examples:", args.max_examples)
     print("dataset_repo:", GLUE_DATASET_REPO)
@@ -631,7 +729,14 @@ def main():
                 f1_delta = metrics["f1"] - baseline_metrics["f1"]
 
             row = {
+                "track": TRACK_NAME,
                 "task": task_name,
+                "model_name": task_cfg["checkpoint"],
+                "split": task_cfg["split"],
+                "primary_metric": task_cfg["primary_metric"],
+                "max_length": args.max_length,
+                "tile_n": args.tile_n,
+                "num_blocks": num_blocks,
                 "case": case.name,
                 "accuracy": metrics["accuracy"],
                 "f1": metrics.get("f1"),
@@ -641,13 +746,18 @@ def main():
                 "qk_computed_tiles": stats["qk_computed_tiles"],
                 "qk_skipped_tiles": stats["qk_skipped_tiles"],
                 "qk_sparse_density": stats["qk_sparse_density"],
+                "padded_qk_sparse_density": stats["qk_sparse_density"],
                 "qk_tile_skip_ratio": stats["qk_tile_skip_ratio"],
+                "padded_qk_tile_skip_ratio": stats["qk_tile_skip_ratio"],
                 "bit_ops_total": stats["bit_ops_total"],
+                "tcs_rows_total": stats["tcs_rows_total"],
+                "tcs_rows_skipped": stats["tcs_rows_skipped"],
                 "tcs_row_skip_ratio": stats["tcs_row_skip_ratio"],
             }
             row.update(logit_diagnostics)
             row.update(input_length_stats)
             row.update(sparse_real_token_stats if case.enable_sparse else empty_sparse_real_token_stats())
+            row.update(compute_activity_metrics(case, stats))
             all_rows.append(row)
             print(
                 f"  accuracy={fmt_float(row['accuracy'])} "
@@ -656,6 +766,8 @@ def main():
                 f"computed/skipped={row['qk_computed_tiles']}/{row['qk_skipped_tiles']} "
                 f"bit_ops={row['bit_ops_total']} "
                 f"tcs_row_skip={fmt_float(row['tcs_row_skip_ratio'])} "
+                f"reduction_dense={row['reduction_vs_dense_str']} "
+                f"reduction_bigbird={row['reduction_vs_bigbird_str']} "
                 f"logit_diff_max={fmt_float(row['max_logit_diff_vs_baseline'])} "
                 f"changed_preds={fmt_cell(row['num_changed_predictions_vs_baseline'])} "
                 f"real_skip_ratio={fmt_float(row['real_qk_tile_skip_ratio'])}"
@@ -664,6 +776,7 @@ def main():
         run_equivalence_checks(task_name, logits_by_case)
 
     print_table(all_rows)
+    print_compact_table(all_rows)
 
 
 if __name__ == "__main__":
