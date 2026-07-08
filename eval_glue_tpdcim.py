@@ -143,7 +143,11 @@ def collate_batch(batch):
 
 
 def load_model(checkpoint, device):
-    model = AutoModelForSequenceClassification.from_pretrained(checkpoint)
+    # Force safetensors so torch 2.5 environments avoid transformers' torch.load CVE guard.
+    model = AutoModelForSequenceClassification.from_pretrained(
+        checkpoint,
+        use_safetensors=True,
+    )
     model.to(device)
     model.eval()
     return model
