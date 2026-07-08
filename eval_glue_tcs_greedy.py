@@ -42,30 +42,24 @@ START_THRESHOLDS = {
     "bw_B": BW_B,
     "bw_E": BW_E,
 }
-THRESHOLD_PRESETS = {
-    "range": None,
-    # Paper-style MNLI candidate grid observed in the TP-DCIM threshold search.
-    # This is a search grid, not an 8-bit threshold vector.
-    "paper_mnli": [0, 8, 16, 24, 36, 48],
-}
 
 PRESET_HELP = """
-Recommended first passes:
+Recommended runs:
 
-A. Paper-wise BERT classifier scaling, 8 sequence blocks:
-   python eval_glue_tcs_greedy.py --task mnli --max-examples 128 --batch-size 4 --max-length 128 --tile-n 16 --threshold-preset paper_mnli
-   Then rerun the promising setting with --max-examples 512.
+A. Quick sanity run with a coarse candidate grid:
+   python eval_glue_tcs_greedy.py --task mnli --max-examples 128 --batch-size 4 --max-length 128 --tile-n 16 --candidate-thresholds 0,8,16,24,36,48
 
-B. Full MRPC validation with the same 8-block classifier scaling:
-   python eval_glue_tcs_greedy.py --task mrpc --batch-size 8 --max-length 128 --tile-n 16 --threshold-max 48 --threshold-step 4
+B. Full MNLI calibration with the same candidate grid:
+   python eval_glue_tcs_greedy.py --task mnli --batch-size 4 --max-length 128 --tile-n 16 --candidate-thresholds 0,8,16,24,36,48
 
-C. Padded 8-block diagnostic, closer to the paper's 8 Q/K blocks but mostly padding on GLUE:
-   python eval_glue_tcs_greedy.py --task mnli --max-examples 512 --batch-size 4 --max-length 512 --tile-n 64 --threshold-preset paper_mnli
+C. Evaluate a paper-reported threshold vector without using it as a candidate grid:
+   python eval_glue_tcs_greedy.py --task mnli --batch-size 4 --max-length 128 --tile-n 16 --fixed-thresholds-msb-to-lsb <8 comma-separated values> --skip-greedy
 
 Interpretation:
 - The greedy reference is sparse_bitserial, i.e. the BigBird-like proxy before TCS.
-- The objective is not to hit a target x0.71 ratio. It maximizes TCS row skipping while keeping task score drop within --allowed-drop.
-- Thresholds are printed in the simulator's current LSB-to-MSB convention.
+- Candidate thresholds are scalar values tried independently for each bit.
+- Fixed/start threshold vectors must contain 8 values.
+- Paper vectors reported as MSB-to-LSB are reversed internally because the simulator stores thresholds as LSB-to-MSB.
 """
 
 
@@ -80,18 +74,47 @@ def parse_args():
     parser.add_argument("--max-length", type=int, default=128)
     parser.add_argument("--tile-n", type=int, default=16)
     parser.add_argument("--local-window", type=int, default=1)
-    parser.add_argument("--max-examples", type=int, default=128)
+    parser.add_argument(
+        "--max-examples",
+        type=int,
+        default=None,
+        help="Optional cap for quick calibration. Omit for the full validation split.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--start-thresholds", choices=sorted(START_THRESHOLDS), default="zero")
+    parser.add_argument(
+        "--start-thresholds-lsb-to-msb",
+        default=None,
+        help="Custom 8-value starting vector in simulator order. Overrides --start-thresholds.",
+    )
+    parser.add_argument(
+        "--start-thresholds-msb-to-lsb",
+        default=None,
+        help="Custom 8-value starting vector in paper order. Reversed internally.",
+    )
+    parser.add_argument(
+        "--fixed-thresholds-lsb-to-msb",
+        default=None,
+        help="Evaluate one fixed 8-value vector in simulator order before optional greedy search.",
+    )
+    parser.add_argument(
+        "--fixed-thresholds-msb-to-lsb",
+        default=None,
+        help="Evaluate one fixed 8-value vector in paper order before optional greedy search.",
+    )
+    parser.add_argument(
+        "--skip-greedy",
+        action="store_true",
+        help="Only evaluate baseline/sparse/fixed thresholds; do not run greedy search.",
+    )
     parser.add_argument("--greedy-order", choices=["msb_to_lsb", "lsb_to_msb"], default="msb_to_lsb")
-    parser.add_argument("--threshold-preset", choices=sorted(THRESHOLD_PRESETS), default="range")
     parser.add_argument("--threshold-min", type=int, default=0)
     parser.add_argument("--threshold-max", type=int, default=48)
     parser.add_argument("--threshold-step", type=int, default=4)
     parser.add_argument(
         "--candidate-thresholds",
         default=None,
-        help="Optional comma-separated threshold list, e.g. 0,8,16,24,36,48. Overrides --threshold-preset and range options.",
+        help="Optional comma-separated scalar candidate list, e.g. 0,8,16,24,36,48. These are not an 8-bit vector.",
     )
     parser.add_argument(
         "--allowed-drop",
@@ -130,10 +153,58 @@ def parse_args():
     return parser.parse_args()
 
 
+def parse_threshold_vector(raw_value, name):
+    values = []
+    for item in raw_value.split(","):
+        item = item.strip()
+        if item:
+            values.append(int(item))
+    if len(values) != 8:
+        raise ValueError(f"{name} must contain exactly 8 comma-separated integers")
+    if min(values) < 0:
+        raise ValueError(f"{name} must contain non-negative thresholds")
+    return values
+
+
+def thresholds_from_args(lsb_to_msb, msb_to_lsb, arg_name):
+    if lsb_to_msb is not None and msb_to_lsb is not None:
+        raise ValueError(f"Pass only one of {arg_name}-lsb-to-msb or {arg_name}-msb-to-lsb")
+    if lsb_to_msb is not None:
+        return parse_threshold_vector(lsb_to_msb, f"{arg_name}-lsb-to-msb")
+    if msb_to_lsb is not None:
+        return list(reversed(parse_threshold_vector(msb_to_lsb, f"{arg_name}-msb-to-lsb")))
+    return None
+
+
+def get_start_thresholds(args):
+    custom = thresholds_from_args(
+        args.start_thresholds_lsb_to_msb,
+        args.start_thresholds_msb_to_lsb,
+        "--start-thresholds",
+    )
+    if custom is not None:
+        return custom
+    return list(START_THRESHOLDS[args.start_thresholds])
+
+
+def get_fixed_thresholds(args):
+    return thresholds_from_args(
+        args.fixed_thresholds_lsb_to_msb,
+        args.fixed_thresholds_msb_to_lsb,
+        "--fixed-thresholds",
+    )
+
+
 def format_thresholds(thresholds):
     if thresholds is None:
         return "-"
     return "[" + ",".join(str(int(v)) for v in thresholds) + "]"
+
+
+def format_thresholds_msb_to_lsb(thresholds):
+    if thresholds is None:
+        return "-"
+    return format_thresholds(list(reversed(thresholds)))
 
 
 def format_duration(seconds):
@@ -159,15 +230,13 @@ def parse_candidate_thresholds(args):
             item = item.strip()
             if item:
                 values.append(int(item))
-    elif args.threshold_preset != "range":
-        values = list(THRESHOLD_PRESETS[args.threshold_preset])
     else:
         values = list(range(args.threshold_min, args.threshold_max + 1, args.threshold_step))
 
     if not values:
         raise ValueError("No candidate thresholds were provided.")
     if min(values) < 0:
-        raise ValueError("TCS thresholds must be non-negative.")
+        raise ValueError("TCS candidate thresholds must be non-negative.")
     return sorted(set(values))
 
 
@@ -299,6 +368,7 @@ def make_summary_row(
         "num_blocks": ceil_div(args.max_length, args.tile_n),
         "stage": stage,
         "thresholds_lsb_to_msb": format_thresholds(thresholds),
+        "thresholds_msb_to_lsb": format_thresholds_msb_to_lsb(thresholds),
         "primary_metric": primary_metric,
         "primary_score": primary_score,
         "accuracy": metrics["accuracy"],
@@ -368,7 +438,9 @@ def maybe_print_candidate_start(args, progress, label, key):
         elapsed = time.time() - progress["started_at"]
         print(
             f"[candidate {candidate_index}/~{progress['approx_total']}] start "
-            f"{label} thresholds={format_thresholds(key)} elapsed={format_duration(elapsed)}",
+            f"{label} thresholds_lsb={format_thresholds(key)} "
+            f"thresholds_msb={format_thresholds_msb_to_lsb(key)} "
+            f"elapsed={format_duration(elapsed)}",
             flush=True,
         )
     return should_print
@@ -459,7 +531,7 @@ def run_greedy_search(
     sparse_logits,
     sparse_predictions,
 ):
-    thresholds = list(START_THRESHOLDS[args.start_thresholds])
+    thresholds = get_start_thresholds(args)
     candidate_values = parse_candidate_thresholds(args)
     bit_order = list(reversed(range(8))) if args.greedy_order == "msb_to_lsb" else list(range(8))
     approx_total = 1 + len(bit_order) * len(candidate_values)
@@ -555,7 +627,8 @@ def run_greedy_search(
             f"valid_candidates={len(valid_trials)} score={fmt_float(chosen['primary_score'])} "
             f"drop_vs_sparse={fmt_float(chosen['score_drop_vs_sparse_reference'])} "
             f"tcs_skip={fmt_float(chosen['tcs_row_skip_ratio'])} "
-            f"thresholds={format_thresholds(thresholds)} note={note}",
+            f"thresholds_lsb={format_thresholds(thresholds)} "
+            f"thresholds_msb={format_thresholds_msb_to_lsb(thresholds)} note={note}",
         )
         step_rows.append(
             {
@@ -563,6 +636,7 @@ def run_greedy_search(
                 "bit": bit,
                 "chosen_threshold": thresholds[bit],
                 "thresholds_lsb_to_msb": format_thresholds(thresholds),
+                "thresholds_msb_to_lsb": format_thresholds_msb_to_lsb(thresholds),
                 "valid_candidates": len(valid_trials),
                 "note": note,
                 "primary_score": chosen["primary_score"],
@@ -600,6 +674,42 @@ def run_greedy_search(
     return initial_row, final_row, step_rows, candidate_rows
 
 
+def evaluate_fixed_thresholds(task_name, task_cfg, loader, args, software_score, sparse_score, sparse_logits, sparse_predictions, fixed_thresholds):
+    print(
+        "Running fixed TCS vector: "
+        f"lsb_to_msb={format_thresholds(fixed_thresholds)} "
+        f"msb_to_lsb={format_thresholds_msb_to_lsb(fixed_thresholds)}",
+        flush=True,
+    )
+    model = load_patched_sparse_model(task_cfg, args, enable_tcs=True, thresholds=fixed_thresholds)
+    metrics, stats, logits, predictions = evaluate_loaded_model(
+        model,
+        task_name,
+        task_cfg,
+        loader,
+        args.device,
+    )
+    del model
+    if args.device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    return make_summary_row(
+        stage="tcs_fixed_reference",
+        task_name=task_name,
+        task_cfg=task_cfg,
+        args=args,
+        metrics=metrics,
+        stats=stats,
+        logits=logits,
+        predictions=predictions,
+        software_score=software_score,
+        sparse_score=sparse_score,
+        sparse_logits=sparse_logits,
+        sparse_predictions=sparse_predictions,
+        thresholds=fixed_thresholds,
+        enable_tcs=True,
+    )
+
+
 def print_table(title, headers, rows):
     print("\n" + title)
     print(" | ".join(headers))
@@ -612,6 +722,7 @@ def print_summary_table(rows):
     headers = [
         "stage",
         "thresholds_lsb_to_msb",
+        "thresholds_msb_to_lsb",
         "primary_metric",
         "primary_score",
         "accuracy",
@@ -635,11 +746,14 @@ def print_summary_table(rows):
 
 
 def print_step_table(rows):
+    if not rows:
+        return
     headers = [
         "step",
         "bit",
         "chosen_threshold",
         "thresholds_lsb_to_msb",
+        "thresholds_msb_to_lsb",
         "valid_candidates",
         "note",
         "primary_score",
@@ -660,6 +774,7 @@ def print_candidate_table(rows):
         "bit",
         "trial_threshold",
         "thresholds_lsb_to_msb",
+        "thresholds_msb_to_lsb",
         "valid",
         "rejection_reason",
         "primary_score",
@@ -676,6 +791,9 @@ def main():
     args = parse_args()
     task_cfg = TASKS[args.task]
     num_blocks = ceil_div(args.max_length, args.tile_n)
+    candidate_thresholds = parse_candidate_thresholds(args)
+    start_thresholds = get_start_thresholds(args)
+    fixed_thresholds = get_fixed_thresholds(args)
 
     print("track:", TRACK_NAME)
     print("task:", args.task)
@@ -684,7 +802,7 @@ def main():
     print("dataset_repo:", GLUE_DATASET_REPO)
     print("device:", args.device)
     print("batch_size:", args.batch_size)
-    print("max_examples:", args.max_examples)
+    print("max_examples:", "full" if args.max_examples is None else args.max_examples)
     print("max_length:", args.max_length)
     print("tile_n:", args.tile_n)
     print("num_blocks:", num_blocks)
@@ -692,13 +810,16 @@ def main():
     print("tcs_threshold_order:", TCS_THRESHOLD_ORDER)
     print("tcs_active_rule:", TCS_ACTIVE_RULE)
     print("greedy_order:", args.greedy_order)
-    print("start_thresholds:", args.start_thresholds, format_thresholds(START_THRESHOLDS[args.start_thresholds]))
-    print("threshold_preset:", args.threshold_preset)
-    print("candidate_thresholds:", format_thresholds(parse_candidate_thresholds(args)))
+    print("start_thresholds_lsb_to_msb:", format_thresholds(start_thresholds))
+    print("start_thresholds_msb_to_lsb:", format_thresholds_msb_to_lsb(start_thresholds))
+    print("fixed_thresholds_lsb_to_msb:", format_thresholds(fixed_thresholds))
+    print("fixed_thresholds_msb_to_lsb:", format_thresholds_msb_to_lsb(fixed_thresholds))
+    print("candidate_thresholds:", format_thresholds(candidate_thresholds))
     print("allowed_drop:", args.allowed_drop)
     print("max_changed_pred_ratio:", args.max_changed_pred_ratio)
     print("max_mean_logit_diff:", args.max_mean_logit_diff)
     print("progress_every:", args.progress_every)
+    print("skip_greedy:", args.skip_greedy)
     print("Note: sparse_bitserial is the greedy reference; software baseline is reported for context.")
     print("Note: this is task-level trend calibration, not exact TP-DCIM paper reproduction.")
 
@@ -806,35 +927,55 @@ def main():
         flush=True,
     )
 
-    print("Running GLUE-constrained TCS greedy search ...", flush=True)
-    search_model = load_patched_sparse_model(
-        task_cfg,
-        args,
-        enable_tcs=True,
-        thresholds=START_THRESHOLDS[args.start_thresholds],
-    )
-    initial_row, final_row, step_rows, candidate_rows = run_greedy_search(
-        model=search_model,
-        task_name=args.task,
-        task_cfg=task_cfg,
-        loader=loader,
-        args=args,
-        software_score=software_score,
-        sparse_score=sparse_score,
-        sparse_logits=sparse_logits,
-        sparse_predictions=sparse_predictions,
-    )
-    del search_model
-    if args.device.startswith("cuda"):
-        torch.cuda.empty_cache()
+    summary_rows = [software_row, sparse_row]
 
-    initial_row = dict(initial_row)
-    initial_row["stage"] = "tcs_initial"
-    final_row = dict(final_row)
-    final_row["stage"] = "tcs_greedy_final"
+    if fixed_thresholds is not None:
+        fixed_row = evaluate_fixed_thresholds(
+            task_name=args.task,
+            task_cfg=task_cfg,
+            loader=loader,
+            args=args,
+            software_score=software_score,
+            sparse_score=sparse_score,
+            sparse_logits=sparse_logits,
+            sparse_predictions=sparse_predictions,
+            fixed_thresholds=fixed_thresholds,
+        )
+        summary_rows.append(fixed_row)
+
+    step_rows = []
+    candidate_rows = []
+    if not args.skip_greedy:
+        print("Running GLUE-constrained TCS greedy search ...", flush=True)
+        search_model = load_patched_sparse_model(
+            task_cfg,
+            args,
+            enable_tcs=True,
+            thresholds=start_thresholds,
+        )
+        initial_row, final_row, step_rows, candidate_rows = run_greedy_search(
+            model=search_model,
+            task_name=args.task,
+            task_cfg=task_cfg,
+            loader=loader,
+            args=args,
+            software_score=software_score,
+            sparse_score=sparse_score,
+            sparse_logits=sparse_logits,
+            sparse_predictions=sparse_predictions,
+        )
+        del search_model
+        if args.device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+        initial_row = dict(initial_row)
+        initial_row["stage"] = "tcs_initial"
+        final_row = dict(final_row)
+        final_row["stage"] = "tcs_greedy_final"
+        summary_rows.extend([initial_row, final_row])
 
     print_step_table(step_rows)
-    print_summary_table([software_row, sparse_row, initial_row, final_row])
+    print_summary_table(summary_rows)
     if args.print_candidates:
         print_candidate_table(candidate_rows)
 
