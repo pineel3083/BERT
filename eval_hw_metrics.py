@@ -62,6 +62,10 @@ def format_thresholds(thresholds):
     return "[" + ",".join(str(int(v)) for v in thresholds) + "]"
 
 
+def format_blocks(blocks):
+    return "[" + ",".join(str(int(v)) for v in blocks) + "]"
+
+
 def sparse_block_counts(num_blocks, args):
     block_mask = make_sparse_block_mask(
         num_blocks=num_blocks,
@@ -76,7 +80,17 @@ def sparse_block_counts(num_blocks, args):
     return block_mask, total_per_layer_head, computed_per_layer_head, skipped_per_layer_head
 
 
+def is_default_sparse_shape(args):
+    return (
+        args.local_window == 1
+        and args.num_random_blocks == 0
+        and tuple(args.global_blocks) == (0,)
+    )
+
+
 def assert_expected_counts(N, args, total_per_layer_head, computed_per_layer_head):
+    if not is_default_sparse_shape(args):
+        return
     if N == 2048 and args.tile_n == 256:
         assert total_per_layer_head == 64, total_per_layer_head
         assert computed_per_layer_head == 34, computed_per_layer_head
@@ -190,6 +204,9 @@ def make_row(args, N, mode, method, qk_total_tiles, qk_computed_tiles, qk_skippe
         "N": N,
         "tile_n": args.tile_n,
         "num_blocks": ceil_div(N, args.tile_n),
+        "local_window": args.local_window,
+        "global_blocks": format_blocks(args.global_blocks),
+        "num_random_blocks": args.num_random_blocks,
         "layers": args.layers,
         "heads": args.heads,
         "head_dim": args.head_dim,
@@ -285,6 +302,9 @@ def print_table(rows):
         "N",
         "tile_n",
         "num_blocks",
+        "local_window",
+        "global_blocks",
+        "num_random_blocks",
         "layers",
         "heads",
         "head_dim",
@@ -348,6 +368,9 @@ def main():
     print("Note: this is a paper-like QK activity proxy, not exact paper reproduction.")
     print("Note: values are not measured CUDA speedup, memory saving, energy, or cycle-accurate hardware data.")
     print("TCS convention: thresholds are LSB-to-MSB, active row rule is bit_sum > threshold.")
+    print("local_window:", args.local_window)
+    print("global_blocks:", format_blocks(args.global_blocks))
+    print("num_random_blocks:", args.num_random_blocks)
     print("target_reduction_vs_bigbird:", args.target_reduction_vs_bigbird)
 
     rows = []
