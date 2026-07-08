@@ -32,7 +32,11 @@ C. BigBird-like random-block diagnostic:
    python eval_glue_tpdcim.py --tasks mnli --max-examples 512 --batch-size 4 --max-length 128 --tile-n 16 --num-random-blocks 1
    Expected: less sparse drop than local+global only, with lower skip ratio.
 
-D. Aggressive diagnostic case:
+D. Evaluate a locally fine-tuned checkpoint:
+   python eval_glue_tpdcim.py --tasks mnli --checkpoint checkpoints/dense_mnli_len128 --checkpoint-label-order dataset --batch-size 4 --max-length 128 --tile-n 16 --num-random-blocks 1
+   Expected: custom MNLI checkpoints trained by finetune_glue_dense.py use dataset label order.
+
+E. Aggressive diagnostic case:
    python eval_glue_tpdcim.py --tasks mnli --max-examples 512 --batch-size 4 --max-length 128 --tile-n 8
    Expected: num_blocks=16, stronger sparse pressure on real-token attention.
 """
@@ -114,6 +118,22 @@ def parse_args():
         choices=sorted(TASKS),
         help="GLUE tasks to evaluate.",
     )
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Override the checkpoint for a single-task run, e.g. checkpoints/dense_mnli_len128.",
+    )
+    parser.add_argument("--mrpc-checkpoint", default=None, help="Optional MRPC checkpoint override.")
+    parser.add_argument("--mnli-checkpoint", default=None, help="Optional MNLI checkpoint override.")
+    parser.add_argument(
+        "--checkpoint-label-order",
+        choices=["default", "dataset", "textattack"],
+        default="default",
+        help=(
+            "Prediction label order for checkpoint overrides. Use 'dataset' for checkpoints "
+            "trained by finetune_glue_dense.py; keep 'default' for built-in TextAttack checkpoints."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-length", type=int, default=128)
     parser.add_argument("--tile-n", type=int, default=256)
@@ -127,6 +147,33 @@ def parse_args():
     parser.add_argument("--max-examples", type=int, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
+
+
+def resolve_task_cfg(task_name, args):
+    task_cfg = dict(TASKS[task_name])
+    shared_checkpoint = getattr(args, "checkpoint", None)
+    specific_checkpoint = getattr(args, f"{task_name}_checkpoint", None)
+    task_list = getattr(args, "tasks", [task_name])
+
+    if shared_checkpoint and specific_checkpoint is None and len(task_list) != 1:
+        raise ValueError("--checkpoint is only valid for a single task; use --mnli-checkpoint/--mrpc-checkpoint for multi-task runs")
+
+    checkpoint = specific_checkpoint or shared_checkpoint
+    label_order = getattr(args, "checkpoint_label_order", "default")
+    if checkpoint:
+        task_cfg["checkpoint"] = checkpoint
+        if label_order == "dataset":
+            task_cfg["prediction_label_map"] = None
+        elif label_order == "textattack":
+            task_cfg["prediction_label_map"] = TASKS[task_name].get("prediction_label_map")
+        elif task_name == "mnli" and not str(checkpoint).startswith("textattack/"):
+            # Locally trained checkpoints normally follow the HF GLUE dataset ids directly.
+            task_cfg["prediction_label_map"] = None
+    elif label_order == "dataset":
+        task_cfg["prediction_label_map"] = None
+    elif label_order == "textattack":
+        task_cfg["prediction_label_map"] = TASKS[task_name].get("prediction_label_map")
+    return task_cfg
 
 
 def ceil_div(value, divisor):
@@ -282,6 +329,7 @@ def print_experiment_presets():
     print("  paper-like padded workload: --max-length 512 --tile-n 64")
     print("  scaled real-token stress: --max-length 128 --tile-n 16")
     print("  BigBird-like extra random blocks: --max-length 128 --tile-n 16 --num-random-blocks 1")
+    print("  custom dense checkpoint: --tasks mnli --checkpoint checkpoints/dense_mnli_len128 --checkpoint-label-order dataset")
     print("  aggressive sparse stress: --max-length 128 --tile-n 8")
 
 
@@ -672,6 +720,7 @@ def main():
     print("num_random_blocks:", args.num_random_blocks)
     print("max_examples:", args.max_examples)
     print("dataset_repo:", GLUE_DATASET_REPO)
+    print("checkpoint_label_order:", args.checkpoint_label_order)
     print("Note: GLUE task scores are trend/sanity checks, not exact TP-DCIM paper reproduction.")
     print("Note: operation metrics are hardware-oriented activity proxies, not measured CUDA speed, memory, or energy.")
     print_experiment_presets()
@@ -679,12 +728,14 @@ def main():
     all_rows = []
 
     for task_name in args.tasks:
-        task_cfg = TASKS[task_name]
+        task_cfg = resolve_task_cfg(task_name, args)
         print("\n" + "=" * 80)
         print(f"TASK: {task_name} ({task_cfg['checkpoint']}, split={task_cfg['split']})")
         label_map = task_cfg.get("prediction_label_map")
         if label_map is not None:
             print(f"prediction_label_map: {label_map}")
+        else:
+            print("prediction_label_map: dataset order")
         print("=" * 80)
 
         tokenizer = AutoTokenizer.from_pretrained(task_cfg["checkpoint"])
