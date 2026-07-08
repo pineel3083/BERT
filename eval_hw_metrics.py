@@ -28,6 +28,15 @@ def parse_args():
     parser.add_argument("--num-random-blocks", type=int, default=0)
     parser.add_argument("--threshold-sets", nargs="+", default=["bw_B", "bw_E"], choices=sorted(THRESHOLD_SETS))
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--run-sweep", action="store_true", help="Run a uniform [t]*8 threshold sweep.")
+    parser.add_argument("--run-greedy-search", action="store_true", help="Search bit-wise thresholds for a target BigBird-relative reduction.")
+    parser.add_argument("--target-reduction-vs-bigbird", type=float, default=0.71)
+    parser.add_argument("--sweep-min-threshold", type=int, default=0)
+    parser.add_argument("--sweep-max-threshold", type=int, default=None)
+    parser.add_argument("--sweep-step", type=int, default=1)
+    parser.add_argument("--sweep-top-k", type=int, default=12)
+    parser.add_argument("--greedy-order", choices=["lsb_to_msb", "msb_to_lsb"], default="lsb_to_msb")
+    parser.add_argument("--greedy-start", choices=["zero", "bw_B", "bw_E"], default="zero")
     return parser.parse_args()
 
 
@@ -47,6 +56,10 @@ def format_reduction(value):
     if value is None:
         return "-"
     return f"x{value:.3f}"
+
+
+def format_thresholds(thresholds):
+    return "[" + ",".join(str(int(v)) for v in thresholds) + "]"
 
 
 def sparse_block_counts(num_blocks, args):
@@ -72,17 +85,18 @@ def assert_expected_counts(N, args, total_per_layer_head, computed_per_layer_hea
         assert computed_per_layer_head == 74, computed_per_layer_head
 
 
-def synthetic_tcs_stats(N, block_mask, thresholds, args):
-    """Estimate TCS row skipping with synthetic INT8 Q bit activity.
+def build_tcs_histograms(N, block_mask, args, max_threshold):
+    """Build per-bit cumulative TCS skipped-row counts.
 
-    This follows the current simulator convention: thresholds are LSB-to-MSB and
-    a row is active when bit_sum > threshold. The result is an activity proxy,
-    not measured hardware speed, energy, or cycle behavior.
+    Thresholds follow the current simulator convention: LSB-to-MSB, active when
+    bit_sum > threshold. Counts are weighted by the number of computed K tiles
+    for the Q block, so they match the existing row-skip activity proxy scale.
     """
-    generator = torch.Generator().manual_seed(args.seed + N + sum(thresholds))
+    generator = torch.Generator().manual_seed(args.seed + N)
     num_blocks = ceil_div(N, args.tile_n)
-    tcs_rows_total = 0
-    tcs_rows_skipped = 0
+    clipped_max = max(max_threshold, args.head_dim)
+    histograms = [torch.zeros(clipped_max + 1, dtype=torch.long) for _ in range(8)]
+    rows_total_by_bit = [0 for _ in range(8)]
 
     for _layer in range(args.layers):
         for _head in range(args.heads):
@@ -103,12 +117,31 @@ def synthetic_tcs_stats(N, block_mask, thresholds, args):
                 )
                 q_uint8 = torch.bitwise_and(q_int8, 255)
 
-                for bit, threshold in enumerate(thresholds):
+                for bit in range(8):
                     q_bit = torch.bitwise_and(torch.bitwise_right_shift(q_uint8, bit), 1)
-                    bit_sum = q_bit.sum(dim=-1)
-                    skipped_rows = int((bit_sum <= threshold).sum().item())
-                    tcs_rows_total += rows * computed_k_tiles
-                    tcs_rows_skipped += skipped_rows * computed_k_tiles
+                    bit_sum = q_bit.sum(dim=-1).to(torch.long)
+                    counts = torch.bincount(bit_sum, minlength=args.head_dim + 1)
+                    histograms[bit][: args.head_dim + 1] += counts * computed_k_tiles
+                    rows_total_by_bit[bit] += rows * computed_k_tiles
+
+    cumulative = [hist.cumsum(dim=0) for hist in histograms]
+    return cumulative, rows_total_by_bit
+
+
+def tcs_stats_from_histograms(cumulative, rows_total_by_bit, thresholds):
+    tcs_rows_total = 0
+    tcs_rows_skipped = 0
+    max_index = cumulative[0].numel() - 1
+
+    for bit, raw_threshold in enumerate(thresholds):
+        threshold = int(raw_threshold)
+        tcs_rows_total += rows_total_by_bit[bit]
+        if threshold < 0:
+            continue
+        if threshold >= max_index:
+            tcs_rows_skipped += rows_total_by_bit[bit]
+        else:
+            tcs_rows_skipped += int(cumulative[bit][threshold].item())
 
     ratio = 0.0 if tcs_rows_total == 0 else tcs_rows_skipped / tcs_rows_total
     return tcs_rows_total, tcs_rows_skipped, ratio
@@ -146,7 +179,7 @@ def make_activity_fields(qk_sparse_density, tcs_row_skip_ratio=None, dense=False
     }
 
 
-def make_row(args, N, mode, method, qk_total_tiles, qk_computed_tiles, qk_skipped_tiles, bit_ops_total, tcs_rows_total=0, tcs_rows_skipped=0, tcs_row_skip_ratio=0.0):
+def make_row(args, N, mode, method, qk_total_tiles, qk_computed_tiles, qk_skipped_tiles, bit_ops_total, tcs_rows_total=0, tcs_rows_skipped=0, tcs_row_skip_ratio=0.0, thresholds=None):
     qk_sparse_density = qk_computed_tiles / qk_total_tiles if qk_total_tiles else 0.0
     qk_tile_skip_ratio = qk_skipped_tiles / qk_total_tiles if qk_total_tiles else 0.0
     dense = method == "dense_baseline"
@@ -162,6 +195,7 @@ def make_row(args, N, mode, method, qk_total_tiles, qk_computed_tiles, qk_skippe
         "head_dim": args.head_dim,
         "mode": mode,
         "method": method,
+        "thresholds_lsb_to_msb": None if thresholds is None else format_thresholds(thresholds),
         "qk_total_tiles": qk_total_tiles,
         "qk_computed_tiles": qk_computed_tiles,
         "qk_skipped_tiles": qk_skipped_tiles,
@@ -175,6 +209,76 @@ def make_row(args, N, mode, method, qk_total_tiles, qk_computed_tiles, qk_skippe
     }
 
 
+def sweep_rows_for_N(args, N, qk_sparse_density, cumulative, rows_total_by_bit):
+    max_threshold = args.sweep_max_threshold if args.sweep_max_threshold is not None else args.head_dim
+    candidates = []
+    for threshold in range(args.sweep_min_threshold, max_threshold + 1, args.sweep_step):
+        thresholds = [threshold] * 8
+        total, skipped, ratio = tcs_stats_from_histograms(cumulative, rows_total_by_bit, thresholds)
+        activity = make_activity_fields(qk_sparse_density, ratio, dense=False)
+        reduction_bigbird = activity["computation_reduction_vs_bigbird"]
+        target_error = abs(reduction_bigbird - args.target_reduction_vs_bigbird)
+        candidates.append(
+            {
+                "search": "uniform_sweep",
+                "N": N,
+                "thresholds_lsb_to_msb": format_thresholds(thresholds),
+                "tcs_rows_total": total,
+                "tcs_rows_skipped": skipped,
+                "tcs_row_skip_ratio": ratio,
+                "computation_reduction_vs_dense": activity["computation_reduction_vs_dense"],
+                "reduction_vs_dense_str": activity["reduction_vs_dense_str"],
+                "computation_reduction_vs_bigbird": reduction_bigbird,
+                "reduction_vs_bigbird_str": activity["reduction_vs_bigbird_str"],
+                "operation_saving_vs_bigbird": activity["operation_saving_vs_bigbird"],
+                "target_reduction_vs_bigbird": args.target_reduction_vs_bigbird,
+                "target_error": target_error,
+            }
+        )
+    return sorted(candidates, key=lambda row: row["target_error"])[: args.sweep_top_k]
+
+
+def greedy_search_for_N(args, N, qk_sparse_density, cumulative, rows_total_by_bit):
+    max_threshold = args.sweep_max_threshold if args.sweep_max_threshold is not None else args.head_dim
+    if args.greedy_start == "zero":
+        thresholds = [0] * 8
+    else:
+        thresholds = list(THRESHOLD_SETS[args.greedy_start])
+
+    bit_order = list(range(8)) if args.greedy_order == "lsb_to_msb" else list(reversed(range(8)))
+    steps = []
+
+    for bit in bit_order:
+        best = None
+        for threshold in range(args.sweep_min_threshold, max_threshold + 1, args.sweep_step):
+            candidate = list(thresholds)
+            candidate[bit] = threshold
+            total, skipped, ratio = tcs_stats_from_histograms(cumulative, rows_total_by_bit, candidate)
+            activity = make_activity_fields(qk_sparse_density, ratio, dense=False)
+            reduction_bigbird = activity["computation_reduction_vs_bigbird"]
+            target_error = abs(reduction_bigbird - args.target_reduction_vs_bigbird)
+            record = (target_error, threshold, total, skipped, ratio, activity)
+            if best is None or record[0] < best[0]:
+                best = record
+
+        target_error, threshold, total, skipped, ratio, activity = best
+        thresholds[bit] = threshold
+        steps.append(
+            {
+                "bit": bit,
+                "chosen_threshold": threshold,
+                "thresholds_lsb_to_msb": format_thresholds(thresholds),
+                "tcs_row_skip_ratio": ratio,
+                "reduction_vs_bigbird_str": activity["reduction_vs_bigbird_str"],
+                "target_error": target_error,
+            }
+        )
+
+    total, skipped, ratio = tcs_stats_from_histograms(cumulative, rows_total_by_bit, thresholds)
+    activity = make_activity_fields(qk_sparse_density, ratio, dense=False)
+    return thresholds, total, skipped, ratio, activity, steps
+
+
 def print_table(rows):
     headers = [
         "track",
@@ -186,6 +290,7 @@ def print_table(rows):
         "head_dim",
         "mode",
         "method",
+        "thresholds_lsb_to_msb",
         "qk_total_tiles",
         "qk_computed_tiles",
         "qk_skipped_tiles",
@@ -204,6 +309,32 @@ def print_table(rows):
         "operation_saving_vs_dense",
         "operation_saving_vs_bigbird",
     ]
+    print("\nMAIN HW ACTIVITY TABLE")
+    print(" | ".join(headers))
+    print(" | ".join("-" * len(h) for h in headers))
+    for row in rows:
+        print(" | ".join(fmt_cell(row.get(header)) for header in headers))
+
+
+def print_search_table(title, rows):
+    if not rows:
+        return
+    headers = [
+        "search",
+        "N",
+        "thresholds_lsb_to_msb",
+        "tcs_rows_total",
+        "tcs_rows_skipped",
+        "tcs_row_skip_ratio",
+        "computation_reduction_vs_dense",
+        "reduction_vs_dense_str",
+        "computation_reduction_vs_bigbird",
+        "reduction_vs_bigbird_str",
+        "operation_saving_vs_bigbird",
+        "target_reduction_vs_bigbird",
+        "target_error",
+    ]
+    print("\n" + title)
     print(" | ".join(headers))
     print(" | ".join("-" * len(h) for h in headers))
     for row in rows:
@@ -212,11 +343,18 @@ def print_table(rows):
 
 def main():
     args = parse_args()
+    max_threshold = args.sweep_max_threshold if args.sweep_max_threshold is not None else args.head_dim
     print("track:", TRACK_NAME)
     print("Note: this is a paper-like QK activity proxy, not exact paper reproduction.")
     print("Note: values are not measured CUDA speedup, memory saving, energy, or cycle-accurate hardware data.")
+    print("TCS convention: thresholds are LSB-to-MSB, active row rule is bit_sum > threshold.")
+    print("target_reduction_vs_bigbird:", args.target_reduction_vs_bigbird)
 
     rows = []
+    sweep_rows = []
+    greedy_rows = []
+    greedy_step_rows = []
+
     for N in args.N_list:
         num_blocks = ceil_div(N, args.tile_n)
         block_mask, total_per_layer_head, computed_per_layer_head, skipped_per_layer_head = sparse_block_counts(num_blocks, args)
@@ -226,6 +364,9 @@ def main():
         dense_total = total_per_layer_head * multiplier
         sparse_computed = computed_per_layer_head * multiplier
         sparse_skipped = skipped_per_layer_head * multiplier
+        qk_sparse_density = sparse_computed / dense_total if dense_total else 0.0
+
+        cumulative, rows_total_by_bit = build_tcs_histograms(N, block_mask, args, max_threshold)
 
         rows.append(
             make_row(
@@ -254,7 +395,7 @@ def main():
 
         for threshold_name in args.threshold_sets:
             thresholds = THRESHOLD_SETS[threshold_name]
-            tcs_total, tcs_skipped, tcs_ratio = synthetic_tcs_stats(N, block_mask, thresholds, args)
+            tcs_total, tcs_skipped, tcs_ratio = tcs_stats_from_histograms(cumulative, rows_total_by_bit, thresholds)
             rows.append(
                 make_row(
                     args=args,
@@ -268,10 +409,73 @@ def main():
                     tcs_rows_total=tcs_total,
                     tcs_rows_skipped=tcs_skipped,
                     tcs_row_skip_ratio=tcs_ratio,
+                    thresholds=thresholds,
                 )
             )
 
+        if args.run_sweep:
+            sweep_rows.extend(sweep_rows_for_N(args, N, qk_sparse_density, cumulative, rows_total_by_bit))
+
+        if args.run_greedy_search:
+            thresholds, total, skipped, ratio, activity, steps = greedy_search_for_N(
+                args, N, qk_sparse_density, cumulative, rows_total_by_bit
+            )
+            rows.append(
+                make_row(
+                    args=args,
+                    N=N,
+                    mode="sparse_bitserial_tcs",
+                    method=f"prop_tcs_greedy_target_{args.target_reduction_vs_bigbird:.3f}",
+                    qk_total_tiles=dense_total,
+                    qk_computed_tiles=sparse_computed,
+                    qk_skipped_tiles=sparse_skipped,
+                    bit_ops_total=sparse_computed * 8,
+                    tcs_rows_total=total,
+                    tcs_rows_skipped=skipped,
+                    tcs_row_skip_ratio=ratio,
+                    thresholds=thresholds,
+                )
+            )
+            greedy_rows.append(
+                {
+                    "search": "greedy_final",
+                    "N": N,
+                    "thresholds_lsb_to_msb": format_thresholds(thresholds),
+                    "tcs_rows_total": total,
+                    "tcs_rows_skipped": skipped,
+                    "tcs_row_skip_ratio": ratio,
+                    "computation_reduction_vs_dense": activity["computation_reduction_vs_dense"],
+                    "reduction_vs_dense_str": activity["reduction_vs_dense_str"],
+                    "computation_reduction_vs_bigbird": activity["computation_reduction_vs_bigbird"],
+                    "reduction_vs_bigbird_str": activity["reduction_vs_bigbird_str"],
+                    "operation_saving_vs_bigbird": activity["operation_saving_vs_bigbird"],
+                    "target_reduction_vs_bigbird": args.target_reduction_vs_bigbird,
+                    "target_error": abs(activity["computation_reduction_vs_bigbird"] - args.target_reduction_vs_bigbird),
+                }
+            )
+            for step_index, step in enumerate(steps):
+                greedy_step_rows.append({"search": f"greedy_step_{step_index}", "N": N, **step})
+
     print_table(rows)
+    print_search_table("UNIFORM THRESHOLD SWEEP TOP-K", sweep_rows)
+    print_search_table("GREEDY SEARCH FINAL", greedy_rows)
+
+    if greedy_step_rows:
+        headers = [
+            "search",
+            "N",
+            "bit",
+            "chosen_threshold",
+            "thresholds_lsb_to_msb",
+            "tcs_row_skip_ratio",
+            "reduction_vs_bigbird_str",
+            "target_error",
+        ]
+        print("\nGREEDY SEARCH STEPS")
+        print(" | ".join(headers))
+        print(" | ".join("-" * len(h) for h in headers))
+        for row in greedy_step_rows:
+            print(" | ".join(fmt_cell(row.get(header)) for header in headers))
 
 
 if __name__ == "__main__":
