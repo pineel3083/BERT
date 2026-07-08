@@ -93,11 +93,22 @@ def make_sparse_block_mask(
             mask[g, :] = True
             mask[:, g] = True
 
-    # Deterministic pseudo-random blocks keep evaluation reproducible.
-    for qi in range(num_blocks):
-        for r in range(num_random_blocks):
-            kj = (qi * 1103515245 + 12345 + r * 97) % num_blocks
-            mask[qi, kj] = True
+    # Deterministic pseudo-random extra blocks keep evaluation reproducible.
+    # Already-enabled local/global tiles are skipped so the option actually adds
+    # distinct sparse connectivity when enough off-mask blocks exist.
+    random_blocks = max(0, int(num_random_blocks))
+    if random_blocks:
+        for qi in range(num_blocks):
+            added = 0
+            attempts = 0
+            start = (qi * 1103515245 + 12345) % max(1, num_blocks)
+            while added < random_blocks and attempts < num_blocks:
+                kj = (start + attempts) % num_blocks
+                attempts += 1
+                if bool(mask[qi, kj]):
+                    continue
+                mask[qi, kj] = True
+                added += 1
 
     return mask
 
@@ -166,6 +177,9 @@ def qkt_tiled_fp32(
         "D": D,
         "tile_n": tile_n,
         "num_blocks": num_blocks,
+        "local_window": local_window,
+        "global_blocks": list(global_blocks),
+        "num_random_blocks": int(num_random_blocks),
         "qk_mode": "fp32",
         "quantization": "none",
         "enable_sparse": enable_sparse,
@@ -267,6 +281,9 @@ def qkt_tiled_int8(
         "D": D,
         "tile_n": tile_n,
         "num_blocks": num_blocks,
+        "local_window": local_window,
+        "global_blocks": list(global_blocks),
+        "num_random_blocks": int(num_random_blocks),
         "qk_mode": "int8",
         "quantization": "per_tile_symmetric_int8",
         "enable_sparse": enable_sparse,
@@ -401,6 +418,9 @@ def qkt_tiled_bitserial(
         "D": D,
         "tile_n": tile_n,
         "num_blocks": num_blocks,
+        "local_window": local_window,
+        "global_blocks": list(global_blocks),
+        "num_random_blocks": int(num_random_blocks),
         "qk_mode": "bitserial",
         "quantization": "per_tile_symmetric_int8",
         "enable_sparse": enable_sparse,
@@ -571,7 +591,7 @@ def enable_qk_tiling(
         attn.tpdcim_enable_sparse = enable_sparse
         attn.tpdcim_local_window = local_window
         attn.tpdcim_global_blocks = global_blocks
-        attn.tpdcim_num_random_blocks = num_random_blocks
+        attn.tpdcim_num_random_blocks = int(num_random_blocks)
         attn.tpdcim_qk_mode = qk_mode
         attn.tpdcim_enable_tcs = enable_tcs
         attn.tpdcim_tcs_thresholds = tcs_thresholds
