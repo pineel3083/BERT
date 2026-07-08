@@ -1,5 +1,6 @@
 import argparse
 from dataclasses import dataclass
+from typing import List, Optional
 
 import torch
 from torch.utils.data import DataLoader
@@ -23,7 +24,7 @@ class EvalCase:
     qk_mode: str = "fp32"
     enable_tcs: bool = False
     tcs_thresholds_name: str = "none"
-    tcs_thresholds: list | None = None
+    tcs_thresholds: Optional[List[int]] = None
 
 
 CASES = [
@@ -127,8 +128,7 @@ def collate_batch(batch):
     keys = batch[0].keys()
     collated = {}
     for key in keys:
-        dtype = torch.long
-        collated[key] = torch.tensor([item[key] for item in batch], dtype=dtype)
+        collated[key] = torch.tensor([item[key] for item in batch], dtype=torch.long)
     return collated
 
 
@@ -194,7 +194,8 @@ def collect_batch_stats(model):
 
 
 def merge_stats(total, batch_stats):
-    total["qk_mode"] = batch_stats["qk_mode"] if batch_stats["qk_mode"] != "baseline" else total["qk_mode"]
+    if batch_stats["qk_mode"] != "baseline":
+        total["qk_mode"] = batch_stats["qk_mode"]
     for key in (
         "qk_computed_tiles",
         "qk_skipped_tiles",
