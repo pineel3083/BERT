@@ -5,7 +5,7 @@ from typing import List, Optional
 import torch
 from torch.utils.data import DataLoader
 from datasets import load_dataset
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
 
 from tpdcim_bert_patch import enable_qk_tiling, make_sparse_block_mask
 
@@ -15,6 +15,22 @@ MNLI_CHECKPOINT = "textattack/bert-base-uncased-MNLI"
 GLUE_DATASET_REPO = "nyu-mll/glue"
 BW_B = [22, 22, 20, 18, 16, 16, 14, 12]
 BW_E = [28, 24, 22, 20, 18, 16, 14, 10]
+
+PRESET_HELP = """
+Recommended experiment presets:
+
+A. Padded workload case:
+   python eval_glue_tpdcim.py --tasks mnli --max-examples 512 --batch-size 4 --max-length 512 --tile-n 64
+   Expected: num_blocks=8, sparse density=0.53125, skipped tiles may be mostly padding for GLUE.
+
+B. Real-token stress case:
+   python eval_glue_tpdcim.py --tasks mnli --max-examples 512 --batch-size 4 --max-length 128 --tile-n 16
+   Expected: num_blocks=8, sparse density=0.53125, real tokens span more blocks.
+
+C. More aggressive sparse stress case:
+   python eval_glue_tpdcim.py --tasks mnli --max-examples 512 --batch-size 4 --max-length 128 --tile-n 8
+   Expected: num_blocks=16, stronger sparse pressure on real-token attention.
+"""
 
 
 @dataclass(frozen=True)
@@ -84,7 +100,9 @@ TASKS = {
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate fine-tuned BERT checkpoints with TPDCIM attention patch on GLUE."
+        description="Evaluate fine-tuned BERT checkpoints with TPDCIM attention patch on GLUE.",
+        epilog=PRESET_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--tasks",
@@ -143,19 +161,30 @@ def tokenize_dataset(tokenizer, task_cfg, max_length, max_examples=None):
     return tokenized
 
 
-def compute_input_length_stats(dataset, tile_n):
-    lengths = []
+def get_num_layers(checkpoint):
+    config = AutoConfig.from_pretrained(checkpoint)
+    return int(getattr(config, "num_hidden_layers", 1))
+
+
+def get_real_blocks(dataset, tile_n, max_length):
+    num_blocks = ceil_div(max_length, tile_n)
     real_blocks = []
+    lengths = []
     for attention_mask in dataset["attention_mask"]:
         nonpad_tokens = int(sum(attention_mask))
         lengths.append(nonpad_tokens)
-        real_blocks.append(ceil_div(nonpad_tokens, tile_n))
+        real_blocks.append(min(ceil_div(nonpad_tokens, tile_n), num_blocks))
+    return lengths, real_blocks
 
+
+def compute_input_length_stats(dataset, tile_n, max_length):
+    lengths, real_blocks = get_real_blocks(dataset, tile_n, max_length)
     if not lengths:
         return {
             "min_nonpad_tokens": 0,
             "mean_nonpad_tokens": 0.0,
             "max_nonpad_tokens": 0,
+            "min_real_blocks": 0,
             "mean_real_blocks": 0.0,
             "max_real_blocks": 0,
         }
@@ -164,18 +193,33 @@ def compute_input_length_stats(dataset, tile_n):
         "min_nonpad_tokens": min(lengths),
         "mean_nonpad_tokens": sum(lengths) / len(lengths),
         "max_nonpad_tokens": max(lengths),
+        "min_real_blocks": min(real_blocks),
         "mean_real_blocks": sum(real_blocks) / len(real_blocks),
         "max_real_blocks": max(real_blocks),
     }
 
 
-def compute_sparse_skip_padding_stats(dataset, args):
-    """Estimate whether sparse-skipped block tiles mostly touch padding.
+def empty_sparse_real_token_stats():
+    return {
+        "skipped_tiles_padding_count": None,
+        "skipped_tiles_real_count": None,
+        "skipped_tile_padding_ratio": None,
+        "skipped_tile_real_ratio": None,
+        "skipped_tiles_mostly_padding": None,
+        "real_qk_total_tiles": None,
+        "real_qk_computed_tiles": None,
+        "real_qk_skipped_tiles": None,
+        "real_qk_sparse_density": None,
+        "real_qk_tile_skip_ratio": None,
+    }
 
-    The TPDCIM counters count block positions once per layer/batch, so this
-    estimate uses each batch's maximum real block count rather than per-sample
-    counts. A skipped tile is padding-related if its query or key block is past
-    the batch's maximum non-pad block.
+
+def compute_sparse_real_token_stats(dataset, args, num_layers):
+    """Count sparse skipped tiles against sample-level real-token blocks.
+
+    Existing QK counters use padded sequence block positions. These diagnostics
+    instead count each sample's real-token block pairs, then scale by layers.
+    They are hardware-oriented activity proxies, not CUDA speed or energy data.
     """
     num_blocks = ceil_div(args.max_length, args.tile_n)
     block_mask = make_sparse_block_mask(
@@ -186,38 +230,58 @@ def compute_sparse_skip_padding_stats(dataset, args):
         device=None,
     )
     skipped_indices = (~block_mask).nonzero(as_tuple=False).tolist()
-    if not skipped_indices:
-        return {
-            "skipped_tile_padding_ratio": None,
-            "skipped_tile_real_ratio": None,
-            "skipped_tiles_mostly_padding": None,
-        }
+    _, real_blocks = get_real_blocks(dataset, args.tile_n, args.max_length)
 
-    real_blocks = []
-    for attention_mask in dataset["attention_mask"]:
-        nonpad_tokens = int(sum(attention_mask))
-        real_blocks.append(min(ceil_div(nonpad_tokens, args.tile_n), num_blocks))
-
-    skipped_total = 0
     skipped_padding = 0
     skipped_real = 0
-    for start in range(0, len(real_blocks), args.batch_size):
-        batch_real_blocks = max(real_blocks[start : start + args.batch_size])
+    real_qk_total = 0
+    real_qk_computed = 0
+
+    for real_block_count in real_blocks:
         for query_block, key_block in skipped_indices:
-            skipped_total += 1
-            if query_block >= batch_real_blocks or key_block >= batch_real_blocks:
+            if query_block >= real_block_count or key_block >= real_block_count:
                 skipped_padding += 1
             else:
                 skipped_real += 1
 
+        real_mask = block_mask[:real_block_count, :real_block_count]
+        sample_total = real_block_count * real_block_count
+        sample_computed = int(real_mask.sum().item())
+        real_qk_total += sample_total
+        real_qk_computed += sample_computed
+
+    skipped_padding *= num_layers
+    skipped_real *= num_layers
+    real_qk_total *= num_layers
+    real_qk_computed *= num_layers
+    real_qk_skipped = real_qk_total - real_qk_computed
+
+    skipped_total = skipped_padding + skipped_real
     padding_ratio = skipped_padding / skipped_total if skipped_total else None
     real_ratio = skipped_real / skipped_total if skipped_total else None
     mostly_padding = None if padding_ratio is None else padding_ratio >= 0.5
+    sparse_density = real_qk_computed / real_qk_total if real_qk_total else None
+    tile_skip_ratio = real_qk_skipped / real_qk_total if real_qk_total else None
+
     return {
+        "skipped_tiles_padding_count": skipped_padding,
+        "skipped_tiles_real_count": skipped_real,
         "skipped_tile_padding_ratio": padding_ratio,
         "skipped_tile_real_ratio": real_ratio,
         "skipped_tiles_mostly_padding": mostly_padding,
+        "real_qk_total_tiles": real_qk_total,
+        "real_qk_computed_tiles": real_qk_computed,
+        "real_qk_skipped_tiles": real_qk_skipped,
+        "real_qk_sparse_density": sparse_density,
+        "real_qk_tile_skip_ratio": tile_skip_ratio,
     }
+
+
+def print_experiment_presets():
+    print("Preset hints:")
+    print("  padded workload: --max-length 512 --tile-n 64")
+    print("  real-token stress: --max-length 128 --tile-n 16")
+    print("  aggressive sparse stress: --max-length 128 --tile-n 8")
 
 
 def collate_batch(batch):
@@ -447,11 +511,19 @@ def print_table(rows):
         "min_nonpad_tokens",
         "mean_nonpad_tokens",
         "max_nonpad_tokens",
+        "min_real_blocks",
         "mean_real_blocks",
         "max_real_blocks",
+        "skipped_tiles_padding_count",
+        "skipped_tiles_real_count",
         "skipped_tile_padding_ratio",
         "skipped_tile_real_ratio",
         "skipped_tiles_mostly_padding",
+        "real_qk_total_tiles",
+        "real_qk_computed_tiles",
+        "real_qk_skipped_tiles",
+        "real_qk_sparse_density",
+        "real_qk_tile_skip_ratio",
     ]
     print("\n" + "=" * 120)
     print("FINAL GLUE TPDCIM SUMMARY")
@@ -486,6 +558,8 @@ def main():
     print("max_examples:", args.max_examples)
     print("dataset_repo:", GLUE_DATASET_REPO)
     print("Note: GLUE task scores are trend/sanity checks, not exact TP-DCIM paper reproduction.")
+    print("Note: operation metrics are hardware-oriented activity proxies, not measured CUDA speed, memory, or energy.")
+    print_experiment_presets()
 
     all_rows = []
 
@@ -499,29 +573,33 @@ def main():
         print("=" * 80)
 
         tokenizer = AutoTokenizer.from_pretrained(task_cfg["checkpoint"])
+        num_layers = get_num_layers(task_cfg["checkpoint"])
         dataset = tokenize_dataset(
             tokenizer=tokenizer,
             task_cfg=task_cfg,
             max_length=args.max_length,
             max_examples=args.max_examples,
         )
-        input_length_stats = compute_input_length_stats(dataset, args.tile_n)
-        sparse_skip_padding_stats = compute_sparse_skip_padding_stats(dataset, args)
+        input_length_stats = compute_input_length_stats(dataset, args.tile_n, args.max_length)
+        sparse_real_token_stats = compute_sparse_real_token_stats(dataset, args, num_layers)
         print(
             "input length stats: "
             f"min/mean/max_nonpad="
             f"{input_length_stats['min_nonpad_tokens']}/"
             f"{fmt_float(input_length_stats['mean_nonpad_tokens'])}/"
             f"{input_length_stats['max_nonpad_tokens']} "
-            f"mean/max_real_blocks="
+            f"min/mean/max_real_blocks="
+            f"{input_length_stats['min_real_blocks']}/"
             f"{fmt_float(input_length_stats['mean_real_blocks'])}/"
             f"{input_length_stats['max_real_blocks']}"
         )
         print(
-            "sparse skipped tile padding estimate: "
-            f"padding_ratio={fmt_float(sparse_skip_padding_stats['skipped_tile_padding_ratio'])} "
-            f"real_ratio={fmt_float(sparse_skip_padding_stats['skipped_tile_real_ratio'])} "
-            f"mostly_padding={fmt_cell(sparse_skip_padding_stats['skipped_tiles_mostly_padding'])}"
+            "sparse real-token estimate (sample x layers): "
+            f"padding_count={sparse_real_token_stats['skipped_tiles_padding_count']} "
+            f"real_count={sparse_real_token_stats['skipped_tiles_real_count']} "
+            f"padding_ratio={fmt_float(sparse_real_token_stats['skipped_tile_padding_ratio'])} "
+            f"real_ratio={fmt_float(sparse_real_token_stats['skipped_tile_real_ratio'])} "
+            f"real_density={fmt_float(sparse_real_token_stats['real_qk_sparse_density'])}"
         )
 
         baseline_metrics = None
@@ -566,18 +644,10 @@ def main():
                 "qk_tile_skip_ratio": stats["qk_tile_skip_ratio"],
                 "bit_ops_total": stats["bit_ops_total"],
                 "tcs_row_skip_ratio": stats["tcs_row_skip_ratio"],
-                "skipped_tile_padding_ratio": (
-                    sparse_skip_padding_stats["skipped_tile_padding_ratio"] if case.enable_sparse else None
-                ),
-                "skipped_tile_real_ratio": (
-                    sparse_skip_padding_stats["skipped_tile_real_ratio"] if case.enable_sparse else None
-                ),
-                "skipped_tiles_mostly_padding": (
-                    sparse_skip_padding_stats["skipped_tiles_mostly_padding"] if case.enable_sparse else None
-                ),
             }
             row.update(logit_diagnostics)
             row.update(input_length_stats)
+            row.update(sparse_real_token_stats if case.enable_sparse else empty_sparse_real_token_stats())
             all_rows.append(row)
             print(
                 f"  accuracy={fmt_float(row['accuracy'])} "
@@ -587,7 +657,8 @@ def main():
                 f"bit_ops={row['bit_ops_total']} "
                 f"tcs_row_skip={fmt_float(row['tcs_row_skip_ratio'])} "
                 f"logit_diff_max={fmt_float(row['max_logit_diff_vs_baseline'])} "
-                f"changed_preds={fmt_cell(row['num_changed_predictions_vs_baseline'])}"
+                f"changed_preds={fmt_cell(row['num_changed_predictions_vs_baseline'])} "
+                f"real_skip_ratio={fmt_float(row['real_qk_tile_skip_ratio'])}"
             )
 
         run_equivalence_checks(task_name, logits_by_case)
