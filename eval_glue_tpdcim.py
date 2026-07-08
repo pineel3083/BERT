@@ -28,7 +28,11 @@ B. Scaled real-token stress case:
    python eval_glue_tpdcim.py --tasks mnli --max-examples 512 --batch-size 4 --max-length 128 --tile-n 16
    Expected: num_blocks=8, real tokens span more blocks, sparse may affect real-token attention.
 
-C. Aggressive diagnostic case:
+C. BigBird-like random-block diagnostic:
+   python eval_glue_tpdcim.py --tasks mnli --max-examples 512 --batch-size 4 --max-length 128 --tile-n 16 --num-random-blocks 1
+   Expected: less sparse drop than local+global only, with lower skip ratio.
+
+D. Aggressive diagnostic case:
    python eval_glue_tpdcim.py --tasks mnli --max-examples 512 --batch-size 4 --max-length 128 --tile-n 8
    Expected: num_blocks=16, stronger sparse pressure on real-token attention.
 """
@@ -114,6 +118,12 @@ def parse_args():
     parser.add_argument("--max-length", type=int, default=128)
     parser.add_argument("--tile-n", type=int, default=256)
     parser.add_argument("--local-window", type=int, default=1)
+    parser.add_argument(
+        "--num-random-blocks",
+        type=int,
+        default=0,
+        help="Deterministic extra K blocks per Q block for BigBird-like sparse attention.",
+    )
     parser.add_argument("--max-examples", type=int, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
@@ -216,7 +226,7 @@ def compute_sparse_real_token_stats(dataset, args, num_layers):
         num_blocks=num_blocks,
         local_window=args.local_window,
         global_blocks=(0,),
-        num_random_blocks=0,
+        num_random_blocks=args.num_random_blocks,
         device=None,
     )
     skipped_indices = (~block_mask).nonzero(as_tuple=False).tolist()
@@ -271,6 +281,7 @@ def print_experiment_presets():
     print("Preset hints:")
     print("  paper-like padded workload: --max-length 512 --tile-n 64")
     print("  scaled real-token stress: --max-length 128 --tile-n 16")
+    print("  BigBird-like extra random blocks: --max-length 128 --tile-n 16 --num-random-blocks 1")
     print("  aggressive sparse stress: --max-length 128 --tile-n 8")
 
 
@@ -302,7 +313,7 @@ def apply_case_patch(model, case, args):
         enable_sparse=case.enable_sparse,
         local_window=args.local_window,
         global_blocks=(0,),
-        num_random_blocks=0,
+        num_random_blocks=args.num_random_blocks,
         qk_mode=case.qk_mode,
         enable_tcs=case.enable_tcs,
         tcs_thresholds=case.tcs_thresholds,
@@ -524,6 +535,7 @@ def print_table(rows):
         "max_length",
         "tile_n",
         "num_blocks",
+        "num_random_blocks",
         "case",
         "accuracy",
         "f1",
@@ -611,7 +623,11 @@ def print_compact_table(rows):
         metric = row["primary_metric"]
         score = row[metric]
         delta = row[f"{metric}_delta"]
-        setting = f"max_length={row['max_length']},tile_n={row['tile_n']}"
+        setting = (
+            f"max_length={row['max_length']},"
+            f"tile_n={row['tile_n']},"
+            f"rand={row['num_random_blocks']}"
+        )
         print(
             " | ".join(
                 [
@@ -653,6 +669,7 @@ def main():
     print("tile_n:", args.tile_n)
     print("num_blocks:", num_blocks)
     print("local_window:", args.local_window)
+    print("num_random_blocks:", args.num_random_blocks)
     print("max_examples:", args.max_examples)
     print("dataset_repo:", GLUE_DATASET_REPO)
     print("Note: GLUE task scores are trend/sanity checks, not exact TP-DCIM paper reproduction.")
@@ -737,6 +754,7 @@ def main():
                 "max_length": args.max_length,
                 "tile_n": args.tile_n,
                 "num_blocks": num_blocks,
+                "num_random_blocks": args.num_random_blocks,
                 "case": case.name,
                 "accuracy": metrics["accuracy"],
                 "f1": metrics.get("f1"),
