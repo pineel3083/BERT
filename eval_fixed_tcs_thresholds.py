@@ -14,6 +14,7 @@ from eval_glue_tpdcim import (
     fmt_float,
     get_num_layers,
     load_model,
+    resolve_task_cfg,
     tokenize_dataset,
 )
 from eval_glue_tcs_greedy import (
@@ -43,6 +44,17 @@ def parse_args():
         description="Evaluate fixed TCS threshold vectors against the sparse_bitserial BigBird proxy."
     )
     parser.add_argument("--task", default="mnli", choices=sorted(TASKS))
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Optional checkpoint override for this task, e.g. checkpoints/dense_mnli_len128.",
+    )
+    parser.add_argument(
+        "--checkpoint-label-order",
+        choices=["default", "dataset", "textattack"],
+        default="default",
+        help="Use 'dataset' for checkpoints trained by finetune_glue_dense.py.",
+    )
     parser.add_argument("--max-examples", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--max-length", type=int, default=128)
@@ -104,6 +116,7 @@ def make_output_row(args, task_cfg, threshold_name, method, row, software_score,
     return {
         "track": TRACK_NAME,
         "task": args.task,
+        "checkpoint": task_cfg["checkpoint"],
         "primary_metric": primary_metric,
         "method": method,
         "threshold_name": threshold_name,
@@ -146,7 +159,9 @@ def make_output_row(args, task_cfg, threshold_name, method, row, software_score,
 def write_csv(path, rows):
     if not rows:
         return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
     columns = list(rows[0].keys())
     with open(path, "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
@@ -196,11 +211,12 @@ def main():
     args = parse_args()
     output_csv = args.output_csv or default_output_csv(args)
     candidates = get_threshold_candidates(args)
-    task_cfg = TASKS[args.task]
+    task_cfg = resolve_task_cfg(args.task, args)
 
     print("track:", TRACK_NAME)
     print("task:", args.task)
     print("checkpoint:", task_cfg["checkpoint"])
+    print("checkpoint_label_order:", args.checkpoint_label_order)
     print("split:", task_cfg["split"])
     print("dataset_repo:", GLUE_DATASET_REPO)
     print("device:", args.device)
