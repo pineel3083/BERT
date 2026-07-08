@@ -1,4 +1,5 @@
 import argparse
+import time
 
 import torch
 from torch.utils.data import DataLoader
@@ -104,6 +105,17 @@ def parse_args():
         help="Optional extra constraint on mean absolute logit diff vs sparse_bitserial reference.",
     )
     parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=1,
+        help="Print one progress line every N uncached candidate evaluations.",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable live greedy-search progress logging.",
+    )
+    parser.add_argument(
         "--print-candidates",
         action="store_true",
         help="Print every candidate tried at each greedy step.",
@@ -115,6 +127,22 @@ def format_thresholds(thresholds):
     if thresholds is None:
         return "-"
     return "[" + ",".join(str(int(v)) for v in thresholds) + "]"
+
+
+def format_duration(seconds):
+    seconds = int(max(0, seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def progress_line(args, message):
+    if not args.no_progress:
+        print(message, flush=True)
 
 
 def parse_candidate_thresholds(args):
@@ -316,6 +344,51 @@ def candidate_sort_key(row):
     )
 
 
+def maybe_print_candidate_start(args, progress, label, key):
+    if progress is None or args.no_progress:
+        return None
+
+    progress["started"] += 1
+    candidate_index = progress["started"]
+    should_print = (
+        args.progress_every <= 1
+        or candidate_index == 1
+        or candidate_index % args.progress_every == 0
+    )
+    if should_print:
+        elapsed = time.time() - progress["started_at"]
+        print(
+            f"[candidate {candidate_index}/~{progress['approx_total']}] start "
+            f"{label} thresholds={format_thresholds(key)} elapsed={format_duration(elapsed)}",
+            flush=True,
+        )
+    return should_print
+
+
+def maybe_print_candidate_done(args, progress, row, should_print):
+    if progress is None or args.no_progress:
+        return
+
+    progress["finished"] += 1
+    if not should_print:
+        return
+
+    elapsed = time.time() - progress["started_at"]
+    avg = elapsed / max(1, progress["finished"])
+    remaining = max(0, progress["approx_total"] - progress["finished"])
+    eta = avg * remaining
+    print(
+        f"[candidate {progress['finished']}/~{progress['approx_total']}] done "
+        f"score={fmt_float(row['primary_score'])} "
+        f"drop_vs_sparse={fmt_float(row['score_drop_vs_sparse_reference'])} "
+        f"tcs_skip={fmt_float(row['tcs_row_skip_ratio'])} "
+        f"valid={fmt_cell(row['valid'])} "
+        f"reason={row['rejection_reason']} "
+        f"elapsed={format_duration(elapsed)} eta~{format_duration(eta)}",
+        flush=True,
+    )
+
+
 def evaluate_thresholds_cached(
     cache,
     model,
@@ -328,11 +401,14 @@ def evaluate_thresholds_cached(
     sparse_score,
     sparse_logits,
     sparse_predictions,
+    progress=None,
+    progress_label="candidate",
 ):
     key = tuple(int(v) for v in thresholds)
     if key in cache:
         return cache[key]
 
+    should_print = maybe_print_candidate_start(args, progress, progress_label, key)
     set_tcs_thresholds(model, key)
     metrics, stats, logits, predictions = evaluate_loaded_model(
         model=model,
@@ -359,6 +435,7 @@ def evaluate_thresholds_cached(
     )
     row["_thresholds_tuple"] = key
     cache[key] = validate_candidate(row, args)
+    maybe_print_candidate_done(args, progress, cache[key], should_print)
     return cache[key]
 
 
@@ -376,10 +453,21 @@ def run_greedy_search(
     thresholds = list(START_THRESHOLDS[args.start_thresholds])
     candidate_values = parse_candidate_thresholds(args)
     bit_order = list(reversed(range(8))) if args.greedy_order == "msb_to_lsb" else list(range(8))
+    approx_total = 1 + len(bit_order) * len(candidate_values)
+    progress = {
+        "approx_total": approx_total,
+        "started": 0,
+        "finished": 0,
+        "started_at": time.time(),
+    }
     cache = {}
     step_rows = []
     candidate_rows = []
 
+    progress_line(
+        args,
+        f"Greedy search will run up to about {approx_total} uncached TCS candidate forward passes.",
+    )
     initial_row = evaluate_thresholds_cached(
         cache,
         model,
@@ -392,11 +480,18 @@ def run_greedy_search(
         sparse_score,
         sparse_logits,
         sparse_predictions,
+        progress=progress,
+        progress_label="initial",
     )
 
     for step_index, bit in enumerate(bit_order):
         trials = []
         values = sorted(set(candidate_values + [thresholds[bit]]))
+        progress_line(
+            args,
+            f"[step {step_index + 1}/{len(bit_order)}] bit={bit} "
+            f"current_threshold={thresholds[bit]} trying={format_thresholds(values)}",
+        )
         for value in values:
             trial_thresholds = list(thresholds)
             trial_thresholds[bit] = value
@@ -412,6 +507,8 @@ def run_greedy_search(
                 sparse_score,
                 sparse_logits,
                 sparse_predictions,
+                progress=progress,
+                progress_label=f"step={step_index} bit={bit} trial_threshold={value}",
             )
             display_row = dict(row)
             display_row["step"] = step_index
@@ -438,9 +535,19 @@ def run_greedy_search(
                 sparse_score,
                 sparse_logits,
                 sparse_predictions,
+                progress=progress,
+                progress_label=f"step={step_index} bit={bit} keep_current",
             )
             note = "no_valid_candidate_keep_current"
 
+        progress_line(
+            args,
+            f"[step {step_index + 1}/{len(bit_order)}] chosen_threshold={thresholds[bit]} "
+            f"valid_candidates={len(valid_trials)} score={fmt_float(chosen['primary_score'])} "
+            f"drop_vs_sparse={fmt_float(chosen['score_drop_vs_sparse_reference'])} "
+            f"tcs_skip={fmt_float(chosen['tcs_row_skip_ratio'])} "
+            f"thresholds={format_thresholds(thresholds)} note={note}",
+        )
         step_rows.append(
             {
                 "step": step_index,
@@ -478,6 +585,8 @@ def run_greedy_search(
         sparse_score,
         sparse_logits,
         sparse_predictions,
+        progress=progress,
+        progress_label="final",
     )
     return initial_row, final_row, step_rows, candidate_rows
 
@@ -579,6 +688,7 @@ def main():
     print("allowed_drop:", args.allowed_drop)
     print("max_changed_pred_ratio:", args.max_changed_pred_ratio)
     print("max_mean_logit_diff:", args.max_mean_logit_diff)
+    print("progress_every:", args.progress_every)
     print("Note: sparse_bitserial is the greedy reference; software baseline is reported for context.")
     print("Note: this is task-level trend calibration, not exact TP-DCIM paper reproduction.")
 
@@ -626,6 +736,7 @@ def main():
         args.device,
     )
     software_score = software_metrics[task_cfg["primary_metric"]]
+    print(f"software baseline done: {task_cfg['primary_metric']}={fmt_float(software_score)}", flush=True)
     del software_model
     if args.device.startswith("cuda"):
         torch.cuda.empty_cache()
@@ -640,6 +751,7 @@ def main():
         args.device,
     )
     sparse_score = sparse_metrics[task_cfg["primary_metric"]]
+    print(f"sparse_bitserial reference done: {task_cfg['primary_metric']}={fmt_float(sparse_score)}", flush=True)
     del sparse_model
     if args.device.startswith("cuda"):
         torch.cuda.empty_cache()
@@ -680,10 +792,11 @@ def main():
     print(
         "reference scores: "
         f"software_{task_cfg['primary_metric']}={fmt_float(software_score)} "
-        f"sparse_{task_cfg['primary_metric']}={fmt_float(sparse_score)}"
+        f"sparse_{task_cfg['primary_metric']}={fmt_float(sparse_score)}",
+        flush=True,
     )
 
-    print("Running GLUE-constrained TCS greedy search ...")
+    print("Running GLUE-constrained TCS greedy search ...", flush=True)
     search_model = load_patched_sparse_model(
         task_cfg,
         args,
