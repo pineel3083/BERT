@@ -141,9 +141,15 @@ def parse_args():
         help="Print one progress line every N uncached candidate evaluations.",
     )
     parser.add_argument(
+        "--batch-progress-every",
+        type=int,
+        default=50,
+        help="Print one batch progress line every N batches inside each model evaluation. Use 0 to disable.",
+    )
+    parser.add_argument(
         "--no-progress",
         action="store_true",
-        help="Disable live greedy-search progress logging.",
+        help="Disable live greedy-search and batch progress logging.",
     )
     parser.add_argument(
         "--print-candidates",
@@ -268,16 +274,64 @@ def make_loader(dataset, args):
     )
 
 
-def evaluate_loaded_model(model, task_name, task_cfg, loader, device):
+def maybe_print_batch_progress(
+    progress_label,
+    batch_index,
+    total_batches,
+    examples_done,
+    total_examples,
+    started_at,
+    progress_every,
+    no_progress,
+):
+    if no_progress or progress_label is None or progress_every <= 0:
+        return
+
+    should_print = (
+        batch_index == 1
+        or batch_index == total_batches
+        or batch_index % progress_every == 0
+    )
+    if not should_print:
+        return
+
+    elapsed = time.time() - started_at
+    avg_per_batch = elapsed / max(1, batch_index)
+    eta = avg_per_batch * max(0, total_batches - batch_index)
+    examples_per_second = examples_done / elapsed if elapsed > 0 else 0.0
+    print(
+        f"[{progress_label}] batch {batch_index}/{total_batches} "
+        f"examples={examples_done}/{total_examples} "
+        f"elapsed={format_duration(elapsed)} eta~{format_duration(eta)} "
+        f"ex/s={examples_per_second:.2f}",
+        flush=True,
+    )
+
+
+def evaluate_loaded_model(
+    model,
+    task_name,
+    task_cfg,
+    loader,
+    device,
+    progress_label=None,
+    progress_every=0,
+    no_progress=False,
+):
     preds = []
     labels = []
     logits_chunks = []
     total_stats = empty_stats()
+    total_batches = len(loader)
+    total_examples = len(loader.dataset) if hasattr(loader, "dataset") else "?"
+    examples_done = 0
+    started_at = time.time()
 
     model.eval()
     with torch.no_grad():
-        for batch in loader:
+        for batch_index, batch in enumerate(loader, start=1):
             labels_batch = batch.pop("labels")
+            examples_done += int(labels_batch.shape[0])
             inputs = {key: value.to(device) for key, value in batch.items()}
             outputs = model(**inputs)
             logits = outputs.logits.detach().cpu()
@@ -288,6 +342,16 @@ def evaluate_loaded_model(model, task_name, task_cfg, loader, device):
             labels.extend(labels_batch.tolist())
             logits_chunks.append(logits)
             merge_stats(total_stats, collect_batch_stats(model))
+            maybe_print_batch_progress(
+                progress_label=progress_label,
+                batch_index=batch_index,
+                total_batches=total_batches,
+                examples_done=examples_done,
+                total_examples=total_examples,
+                started_at=started_at,
+                progress_every=progress_every,
+                no_progress=no_progress,
+            )
 
     metrics = compute_metrics(task_name, preds, labels)
     stats = finalize_stats(total_stats)
@@ -497,6 +561,9 @@ def evaluate_thresholds_cached(
         task_cfg=task_cfg,
         loader=loader,
         device=args.device,
+        progress_label=progress_label,
+        progress_every=args.batch_progress_every,
+        no_progress=args.no_progress,
     )
     row = make_summary_row(
         stage="tcs_candidate",
@@ -688,6 +755,9 @@ def evaluate_fixed_thresholds(task_name, task_cfg, loader, args, software_score,
         task_cfg,
         loader,
         args.device,
+        progress_label="tcs_fixed_reference",
+        progress_every=args.batch_progress_every,
+        no_progress=args.no_progress,
     )
     del model
     if args.device.startswith("cuda"):
@@ -819,6 +889,7 @@ def main():
     print("max_changed_pred_ratio:", args.max_changed_pred_ratio)
     print("max_mean_logit_diff:", args.max_mean_logit_diff)
     print("progress_every:", args.progress_every)
+    print("batch_progress_every:", args.batch_progress_every)
     print("skip_greedy:", args.skip_greedy)
     print("Note: sparse_bitserial is the greedy reference; software baseline is reported for context.")
     print("Note: this is task-level trend calibration, not exact TP-DCIM paper reproduction.")
@@ -865,6 +936,9 @@ def main():
         task_cfg,
         loader,
         args.device,
+        progress_label="software_baseline",
+        progress_every=args.batch_progress_every,
+        no_progress=args.no_progress,
     )
     software_score = software_metrics[task_cfg["primary_metric"]]
     print(f"software baseline done: {task_cfg['primary_metric']}={fmt_float(software_score)}", flush=True)
@@ -880,6 +954,9 @@ def main():
         task_cfg,
         loader,
         args.device,
+        progress_label="sparse_bitserial_reference",
+        progress_every=args.batch_progress_every,
+        no_progress=args.no_progress,
     )
     sparse_score = sparse_metrics[task_cfg["primary_metric"]]
     print(f"sparse_bitserial reference done: {task_cfg['primary_metric']}={fmt_float(sparse_score)}", flush=True)
