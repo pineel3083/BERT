@@ -42,19 +42,25 @@ START_THRESHOLDS = {
     "bw_B": BW_B,
     "bw_E": BW_E,
 }
+THRESHOLD_PRESETS = {
+    "range": None,
+    # Paper-style MNLI candidate grid observed in the TP-DCIM threshold search.
+    # This is a search grid, not an 8-bit threshold vector.
+    "paper_mnli": [0, 8, 16, 24, 36, 48],
+}
 
 PRESET_HELP = """
 Recommended first passes:
 
 A. Paper-wise BERT classifier scaling, 8 sequence blocks:
-   python eval_glue_tcs_greedy.py --task mnli --max-examples 128 --batch-size 4 --max-length 128 --tile-n 16 --threshold-step 4
-   Then rerun the promising setting with --max-examples 512 and --threshold-step 2.
+   python eval_glue_tcs_greedy.py --task mnli --max-examples 128 --batch-size 4 --max-length 128 --tile-n 16 --threshold-preset paper_mnli
+   Then rerun the promising setting with --max-examples 512.
 
 B. Full MRPC validation with the same 8-block classifier scaling:
-   python eval_glue_tcs_greedy.py --task mrpc --batch-size 8 --max-length 128 --tile-n 16 --threshold-step 2
+   python eval_glue_tcs_greedy.py --task mrpc --batch-size 8 --max-length 128 --tile-n 16 --threshold-max 48 --threshold-step 4
 
 C. Padded 8-block diagnostic, closer to the paper's 8 Q/K blocks but mostly padding on GLUE:
-   python eval_glue_tcs_greedy.py --task mnli --max-examples 512 --batch-size 4 --max-length 512 --tile-n 64 --threshold-step 4
+   python eval_glue_tcs_greedy.py --task mnli --max-examples 512 --batch-size 4 --max-length 512 --tile-n 64 --threshold-preset paper_mnli
 
 Interpretation:
 - The greedy reference is sparse_bitserial, i.e. the BigBird-like proxy before TCS.
@@ -78,13 +84,14 @@ def parse_args():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--start-thresholds", choices=sorted(START_THRESHOLDS), default="zero")
     parser.add_argument("--greedy-order", choices=["msb_to_lsb", "lsb_to_msb"], default="msb_to_lsb")
+    parser.add_argument("--threshold-preset", choices=sorted(THRESHOLD_PRESETS), default="range")
     parser.add_argument("--threshold-min", type=int, default=0)
-    parser.add_argument("--threshold-max", type=int, default=32)
-    parser.add_argument("--threshold-step", type=int, default=2)
+    parser.add_argument("--threshold-max", type=int, default=48)
+    parser.add_argument("--threshold-step", type=int, default=4)
     parser.add_argument(
         "--candidate-thresholds",
         default=None,
-        help="Optional comma-separated threshold list, e.g. 0,4,8,12,16,20,24,28,32.",
+        help="Optional comma-separated threshold list, e.g. 0,8,16,24,36,48. Overrides --threshold-preset and range options.",
     )
     parser.add_argument(
         "--allowed-drop",
@@ -152,6 +159,8 @@ def parse_candidate_thresholds(args):
             item = item.strip()
             if item:
                 values.append(int(item))
+    elif args.threshold_preset != "range":
+        values = list(THRESHOLD_PRESETS[args.threshold_preset])
     else:
         values = list(range(args.threshold_min, args.threshold_max + 1, args.threshold_step))
 
@@ -684,6 +693,7 @@ def main():
     print("tcs_active_rule:", TCS_ACTIVE_RULE)
     print("greedy_order:", args.greedy_order)
     print("start_thresholds:", args.start_thresholds, format_thresholds(START_THRESHOLDS[args.start_thresholds]))
+    print("threshold_preset:", args.threshold_preset)
     print("candidate_thresholds:", format_thresholds(parse_candidate_thresholds(args)))
     print("allowed_drop:", args.allowed_drop)
     print("max_changed_pred_ratio:", args.max_changed_pred_ratio)
