@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 from datasets import load_dataset
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from tpdcim_bert_patch import enable_qk_tiling
+from tpdcim_bert_patch import enable_qk_tiling, make_sparse_block_mask
 
 
 MRPC_CHECKPOINT = "textattack/bert-base-uncased-MRPC"
@@ -102,6 +102,10 @@ def parse_args():
     return parser.parse_args()
 
 
+def ceil_div(value, divisor):
+    return (int(value) + int(divisor) - 1) // int(divisor)
+
+
 def load_glue_split(dataset_name, split):
     """Load GLUE from its canonical HF dataset repo.
 
@@ -137,6 +141,83 @@ def tokenize_dataset(tokenizer, task_cfg, max_length, max_examples=None):
     if remove_columns:
         tokenized = tokenized.remove_columns(remove_columns)
     return tokenized
+
+
+def compute_input_length_stats(dataset, tile_n):
+    lengths = []
+    real_blocks = []
+    for attention_mask in dataset["attention_mask"]:
+        nonpad_tokens = int(sum(attention_mask))
+        lengths.append(nonpad_tokens)
+        real_blocks.append(ceil_div(nonpad_tokens, tile_n))
+
+    if not lengths:
+        return {
+            "min_nonpad_tokens": 0,
+            "mean_nonpad_tokens": 0.0,
+            "max_nonpad_tokens": 0,
+            "mean_real_blocks": 0.0,
+            "max_real_blocks": 0,
+        }
+
+    return {
+        "min_nonpad_tokens": min(lengths),
+        "mean_nonpad_tokens": sum(lengths) / len(lengths),
+        "max_nonpad_tokens": max(lengths),
+        "mean_real_blocks": sum(real_blocks) / len(real_blocks),
+        "max_real_blocks": max(real_blocks),
+    }
+
+
+def compute_sparse_skip_padding_stats(dataset, args):
+    """Estimate whether sparse-skipped block tiles mostly touch padding.
+
+    The TPDCIM counters count block positions once per layer/batch, so this
+    estimate uses each batch's maximum real block count rather than per-sample
+    counts. A skipped tile is padding-related if its query or key block is past
+    the batch's maximum non-pad block.
+    """
+    num_blocks = ceil_div(args.max_length, args.tile_n)
+    block_mask = make_sparse_block_mask(
+        num_blocks=num_blocks,
+        local_window=args.local_window,
+        global_blocks=(0,),
+        num_random_blocks=0,
+        device=None,
+    )
+    skipped_indices = (~block_mask).nonzero(as_tuple=False).tolist()
+    if not skipped_indices:
+        return {
+            "skipped_tile_padding_ratio": None,
+            "skipped_tile_real_ratio": None,
+            "skipped_tiles_mostly_padding": None,
+        }
+
+    real_blocks = []
+    for attention_mask in dataset["attention_mask"]:
+        nonpad_tokens = int(sum(attention_mask))
+        real_blocks.append(min(ceil_div(nonpad_tokens, args.tile_n), num_blocks))
+
+    skipped_total = 0
+    skipped_padding = 0
+    skipped_real = 0
+    for start in range(0, len(real_blocks), args.batch_size):
+        batch_real_blocks = max(real_blocks[start : start + args.batch_size])
+        for query_block, key_block in skipped_indices:
+            skipped_total += 1
+            if query_block >= batch_real_blocks or key_block >= batch_real_blocks:
+                skipped_padding += 1
+            else:
+                skipped_real += 1
+
+    padding_ratio = skipped_padding / skipped_total if skipped_total else None
+    real_ratio = skipped_real / skipped_total if skipped_total else None
+    mostly_padding = None if padding_ratio is None else padding_ratio >= 0.5
+    return {
+        "skipped_tile_padding_ratio": padding_ratio,
+        "skipped_tile_real_ratio": real_ratio,
+        "skipped_tiles_mostly_padding": mostly_padding,
+    }
 
 
 def collate_batch(batch):
@@ -187,6 +268,29 @@ def empty_stats():
         "tcs_rows_total": 0,
         "tcs_rows_skipped": 0,
         "tcs_row_skip_ratio": 0.0,
+    }
+
+
+def empty_logit_diagnostics():
+    return {
+        "max_logit_diff_vs_baseline": None,
+        "mean_logit_diff_vs_baseline": None,
+        "num_changed_predictions_vs_baseline": None,
+        "changed_prediction_ratio_vs_baseline": None,
+    }
+
+
+def compute_logit_diagnostics(logits, predictions, baseline_logits, baseline_predictions):
+    if baseline_logits is None or baseline_predictions is None:
+        return empty_logit_diagnostics()
+
+    diff = (logits - baseline_logits).abs()
+    changed = predictions.ne(baseline_predictions)
+    return {
+        "max_logit_diff_vs_baseline": diff.max().item(),
+        "mean_logit_diff_vs_baseline": diff.mean().item(),
+        "num_changed_predictions_vs_baseline": int(changed.sum().item()),
+        "changed_prediction_ratio_vs_baseline": changed.float().mean().item(),
     }
 
 
@@ -296,18 +400,29 @@ def evaluate_case(task_name, task_cfg, dataset, case, args):
     metrics = compute_metrics(task_name, preds, labels)
     stats = finalize_stats(total_stats)
     logits = torch.cat(logits_chunks, dim=0)
+    predictions = torch.tensor(preds, dtype=torch.long)
 
     del model
     if args.device.startswith("cuda"):
         torch.cuda.empty_cache()
 
-    return metrics, stats, logits
+    return metrics, stats, logits, predictions
 
 
 def fmt_float(value, digits=6):
     if value is None:
         return "-"
     return f"{value:.{digits}f}"
+
+
+def fmt_cell(value, digits=6):
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, float):
+        return f"{value:.{digits}f}"
+    return str(value)
 
 
 def print_table(rows):
@@ -318,6 +433,10 @@ def print_table(rows):
         "f1",
         "accuracy_delta",
         "f1_delta",
+        "max_logit_diff_vs_baseline",
+        "mean_logit_diff_vs_baseline",
+        "num_changed_predictions_vs_baseline",
+        "changed_prediction_ratio_vs_baseline",
         "qk_mode",
         "qk_computed_tiles",
         "qk_skipped_tiles",
@@ -325,6 +444,14 @@ def print_table(rows):
         "qk_tile_skip_ratio",
         "bit_ops_total",
         "tcs_row_skip_ratio",
+        "min_nonpad_tokens",
+        "mean_nonpad_tokens",
+        "max_nonpad_tokens",
+        "mean_real_blocks",
+        "max_real_blocks",
+        "skipped_tile_padding_ratio",
+        "skipped_tile_real_ratio",
+        "skipped_tiles_mostly_padding",
     ]
     print("\n" + "=" * 120)
     print("FINAL GLUE TPDCIM SUMMARY")
@@ -332,25 +459,7 @@ def print_table(rows):
     print(" | ".join(headers))
     print(" | ".join("-" * len(h) for h in headers))
     for row in rows:
-        print(
-            " | ".join(
-                [
-                    row["task"],
-                    row["case"],
-                    fmt_float(row["accuracy"]),
-                    fmt_float(row["f1"]),
-                    fmt_float(row["accuracy_delta"]),
-                    fmt_float(row["f1_delta"]),
-                    row["qk_mode"],
-                    str(row["qk_computed_tiles"]),
-                    str(row["qk_skipped_tiles"]),
-                    fmt_float(row["qk_sparse_density"]),
-                    fmt_float(row["qk_tile_skip_ratio"]),
-                    str(row["bit_ops_total"]),
-                    fmt_float(row["tcs_row_skip_ratio"]),
-                ]
-            )
-        )
+        print(" | ".join(fmt_cell(row.get(header)) for header in headers))
 
 
 def run_equivalence_checks(task_name, logits_by_case):
@@ -396,17 +505,48 @@ def main():
             max_length=args.max_length,
             max_examples=args.max_examples,
         )
+        input_length_stats = compute_input_length_stats(dataset, args.tile_n)
+        sparse_skip_padding_stats = compute_sparse_skip_padding_stats(dataset, args)
+        print(
+            "input length stats: "
+            f"min/mean/max_nonpad="
+            f"{input_length_stats['min_nonpad_tokens']}/"
+            f"{fmt_float(input_length_stats['mean_nonpad_tokens'])}/"
+            f"{input_length_stats['max_nonpad_tokens']} "
+            f"mean/max_real_blocks="
+            f"{fmt_float(input_length_stats['mean_real_blocks'])}/"
+            f"{input_length_stats['max_real_blocks']}"
+        )
+        print(
+            "sparse skipped tile padding estimate: "
+            f"padding_ratio={fmt_float(sparse_skip_padding_stats['skipped_tile_padding_ratio'])} "
+            f"real_ratio={fmt_float(sparse_skip_padding_stats['skipped_tile_real_ratio'])} "
+            f"mostly_padding={fmt_cell(sparse_skip_padding_stats['skipped_tiles_mostly_padding'])}"
+        )
 
         baseline_metrics = None
+        baseline_logits = None
+        baseline_predictions = None
         logits_by_case = {}
 
         for case in CASES:
             print(f"Running {task_name}/{case.name} ...")
-            metrics, stats, logits = evaluate_case(task_name, task_cfg, dataset, case, args)
+            metrics, stats, logits, predictions = evaluate_case(task_name, task_cfg, dataset, case, args)
             logits_by_case[case.name] = logits
 
             if case.name == "baseline":
                 baseline_metrics = metrics
+                baseline_logits = logits
+                baseline_predictions = predictions
+                logit_diagnostics = empty_logit_diagnostics()
+            else:
+                logit_diagnostics = compute_logit_diagnostics(
+                    logits=logits,
+                    predictions=predictions,
+                    baseline_logits=baseline_logits,
+                    baseline_predictions=baseline_predictions,
+                )
+
             accuracy_delta = metrics["accuracy"] - baseline_metrics["accuracy"]
             f1_delta = None
             if metrics.get("f1") is not None and baseline_metrics.get("f1") is not None:
@@ -426,7 +566,18 @@ def main():
                 "qk_tile_skip_ratio": stats["qk_tile_skip_ratio"],
                 "bit_ops_total": stats["bit_ops_total"],
                 "tcs_row_skip_ratio": stats["tcs_row_skip_ratio"],
+                "skipped_tile_padding_ratio": (
+                    sparse_skip_padding_stats["skipped_tile_padding_ratio"] if case.enable_sparse else None
+                ),
+                "skipped_tile_real_ratio": (
+                    sparse_skip_padding_stats["skipped_tile_real_ratio"] if case.enable_sparse else None
+                ),
+                "skipped_tiles_mostly_padding": (
+                    sparse_skip_padding_stats["skipped_tiles_mostly_padding"] if case.enable_sparse else None
+                ),
             }
+            row.update(logit_diagnostics)
+            row.update(input_length_stats)
             all_rows.append(row)
             print(
                 f"  accuracy={fmt_float(row['accuracy'])} "
@@ -434,7 +585,9 @@ def main():
                 f"qk_mode={row['qk_mode']} "
                 f"computed/skipped={row['qk_computed_tiles']}/{row['qk_skipped_tiles']} "
                 f"bit_ops={row['bit_ops_total']} "
-                f"tcs_row_skip={fmt_float(row['tcs_row_skip_ratio'])}"
+                f"tcs_row_skip={fmt_float(row['tcs_row_skip_ratio'])} "
+                f"logit_diff_max={fmt_float(row['max_logit_diff_vs_baseline'])} "
+                f"changed_preds={fmt_cell(row['num_changed_predictions_vs_baseline'])}"
             )
 
         run_equivalence_checks(task_name, logits_by_case)
