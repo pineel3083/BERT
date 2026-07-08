@@ -12,6 +12,7 @@ from tpdcim_bert_patch import enable_qk_tiling
 
 MRPC_CHECKPOINT = "textattack/bert-base-uncased-MRPC"
 MNLI_CHECKPOINT = "textattack/bert-base-uncased-MNLI"
+GLUE_DATASET_REPO = "nyu-mll/glue"
 BW_B = [22, 22, 20, 18, 16, 16, 14, 12]
 BW_E = [28, 24, 22, 20, 18, 16, 14, 10]
 
@@ -96,8 +97,17 @@ def parse_args():
     return parser.parse_args()
 
 
+def load_glue_split(dataset_name, split):
+    """Load GLUE from its canonical HF dataset repo.
+
+    Some datasets/huggingface_hub versions no longer resolve the historical
+    short name `glue` cleanly, so prefer the namespace-qualified repo id.
+    """
+    return load_dataset(GLUE_DATASET_REPO, dataset_name, split=split)
+
+
 def tokenize_dataset(tokenizer, task_cfg, max_length, max_examples=None):
-    dataset = load_dataset("glue", task_cfg["dataset_name"], split=task_cfg["split"])
+    dataset = load_glue_split(task_cfg["dataset_name"], task_cfg["split"])
     if max_examples is not None:
         dataset = dataset.select(range(min(max_examples, len(dataset))))
 
@@ -347,6 +357,7 @@ def main():
     print("tile_n:", args.tile_n)
     print("local_window:", args.local_window)
     print("max_examples:", args.max_examples)
+    print("dataset_repo:", GLUE_DATASET_REPO)
     print("Note: GLUE task scores are trend/sanity checks, not exact TP-DCIM paper reproduction.")
 
     all_rows = []
