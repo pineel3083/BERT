@@ -49,11 +49,14 @@ Recommended runs:
 A. Quick sanity run with a coarse candidate grid:
    python eval_glue_tcs_greedy.py --task mnli --max-examples 128 --batch-size 4 --max-length 128 --tile-n 16 --candidate-thresholds 0,8,16,24,36,48
 
-B. Full MNLI calibration with the same candidate grid:
-   python eval_glue_tcs_greedy.py --task mnli --batch-size 4 --max-length 128 --tile-n 16 --candidate-thresholds 0,8,16,24,36,48
+B. Add one BigBird-like random block per query block:
+   python eval_glue_tcs_greedy.py --task mnli --max-examples 128 --batch-size 4 --max-length 128 --tile-n 16 --num-random-blocks 1 --candidate-thresholds 0,8,16,24,36,48
 
-C. Evaluate a paper-reported threshold vector without using it as a candidate grid:
-   python eval_glue_tcs_greedy.py --task mnli --batch-size 4 --max-length 128 --tile-n 16 --fixed-thresholds-msb-to-lsb <8 comma-separated values> --skip-greedy
+C. Full MNLI calibration with the same candidate grid:
+   python eval_glue_tcs_greedy.py --task mnli --batch-size 4 --max-length 128 --tile-n 16 --num-random-blocks 1 --candidate-thresholds 0,8,16,24,36,48
+
+D. Evaluate a paper-reported threshold vector without using it as a candidate grid:
+   python eval_glue_tcs_greedy.py --task mnli --batch-size 4 --max-length 128 --tile-n 16 --num-random-blocks 1 --fixed-thresholds-msb-to-lsb <8 comma-separated values> --skip-greedy
 
 Interpretation:
 - The greedy reference is sparse_bitserial, i.e. the BigBird-like proxy before TCS.
@@ -74,6 +77,12 @@ def parse_args():
     parser.add_argument("--max-length", type=int, default=128)
     parser.add_argument("--tile-n", type=int, default=16)
     parser.add_argument("--local-window", type=int, default=1)
+    parser.add_argument(
+        "--num-random-blocks",
+        type=int,
+        default=0,
+        help="Deterministic extra K blocks per Q block for BigBird-like sparse attention.",
+    )
     parser.add_argument(
         "--max-examples",
         type=int,
@@ -368,7 +377,7 @@ def load_patched_sparse_model(task_cfg, args, enable_tcs, thresholds=None):
         enable_sparse=True,
         local_window=args.local_window,
         global_blocks=(0,),
-        num_random_blocks=0,
+        num_random_blocks=args.num_random_blocks,
         qk_mode="bitserial",
         enable_tcs=enable_tcs,
         tcs_thresholds=thresholds,
@@ -430,6 +439,7 @@ def make_summary_row(
         "max_length": args.max_length,
         "tile_n": args.tile_n,
         "num_blocks": ceil_div(args.max_length, args.tile_n),
+        "num_random_blocks": args.num_random_blocks,
         "stage": stage,
         "thresholds_lsb_to_msb": format_thresholds(thresholds),
         "thresholds_msb_to_lsb": format_thresholds_msb_to_lsb(thresholds),
@@ -791,6 +801,7 @@ def print_table(title, headers, rows):
 def print_summary_table(rows):
     headers = [
         "stage",
+        "num_random_blocks",
         "thresholds_lsb_to_msb",
         "thresholds_msb_to_lsb",
         "primary_metric",
@@ -877,6 +888,7 @@ def main():
     print("tile_n:", args.tile_n)
     print("num_blocks:", num_blocks)
     print("local_window:", args.local_window)
+    print("num_random_blocks:", args.num_random_blocks)
     print("tcs_threshold_order:", TCS_THRESHOLD_ORDER)
     print("tcs_active_rule:", TCS_ACTIVE_RULE)
     print("greedy_order:", args.greedy_order)
