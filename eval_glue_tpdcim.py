@@ -65,6 +65,7 @@ TASKS = {
         "text_columns": ("sentence1", "sentence2"),
         "metric_names": ("accuracy", "f1"),
         "primary_metric": "f1",
+        "prediction_label_map": None,
     },
     "mnli": {
         "checkpoint": MNLI_CHECKPOINT,
@@ -73,6 +74,10 @@ TASKS = {
         "text_columns": ("premise", "hypothesis"),
         "metric_names": ("accuracy",),
         "primary_metric": "accuracy",
+        # TextAttack MNLI logits follow the old Transformers GLUE order:
+        # contradiction, entailment, neutral. HF GLUE ids are:
+        # entailment, neutral, contradiction. This maps model ids to dataset ids.
+        "prediction_label_map": [2, 0, 1],
     },
 }
 
@@ -232,6 +237,14 @@ def finalize_stats(stats):
     return stats
 
 
+def apply_prediction_label_map(batch_preds, task_cfg):
+    prediction_label_map = task_cfg.get("prediction_label_map")
+    if prediction_label_map is None:
+        return batch_preds
+    mapping = torch.tensor(prediction_label_map, dtype=batch_preds.dtype, device=batch_preds.device)
+    return mapping[batch_preds]
+
+
 def compute_metrics(task_name, preds, labels):
     correct = sum(int(p == y) for p, y in zip(preds, labels))
     accuracy = correct / len(labels) if labels else 0.0
@@ -273,6 +286,7 @@ def evaluate_case(task_name, task_cfg, dataset, case, args):
             outputs = model(**inputs)
             logits = outputs.logits.detach().cpu()
             batch_preds = logits.argmax(dim=-1)
+            batch_preds = apply_prediction_label_map(batch_preds, task_cfg)
 
             preds.extend(batch_preds.tolist())
             labels.extend(labels_batch.tolist())
@@ -370,6 +384,9 @@ def main():
         task_cfg = TASKS[task_name]
         print("\n" + "=" * 80)
         print(f"TASK: {task_name} ({task_cfg['checkpoint']}, split={task_cfg['split']})")
+        label_map = task_cfg.get("prediction_label_map")
+        if label_map is not None:
+            print(f"prediction_label_map: {label_map}")
         print("=" * 80)
 
         tokenizer = AutoTokenizer.from_pretrained(task_cfg["checkpoint"])
