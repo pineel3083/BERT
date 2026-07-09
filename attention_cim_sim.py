@@ -568,6 +568,19 @@ def write_timeline_csv(results: Sequence[SimResult], path: str) -> None:
             writer.writerows(result.timeline.iter_csv_rows(result.case))
 
 
+def write_engine_breakdown_csv(results: Sequence[SimResult], path: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="") as handle:
+        fieldnames = ["case", "engine", "role", *ACTIONS]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for result in results:
+            for row in result.timeline.breakdown():
+                row_with_case: Dict[str, object] = {"case": result.case}
+                row_with_case.update(row)
+                writer.writerow(row_with_case)
+
+
 def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 0:
@@ -595,6 +608,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--metrics-csv", default=None)
     parser.add_argument("--timeline-csv", default=None)
+    parser.add_argument("--breakdown-csv", default=None)
     return parser.parse_args()
 
 
@@ -632,10 +646,16 @@ def main() -> None:
 
     metrics_path = args.metrics_csv or os.path.join(cfg.output_dir, f"attention_cim_sim_N{cfg.n}_metrics.csv")
     timeline_path = args.timeline_csv or os.path.join(cfg.output_dir, f"attention_cim_sim_N{cfg.n}_timeline.csv")
+    breakdown_path = args.breakdown_csv or os.path.join(
+        cfg.output_dir,
+        f"attention_cim_sim_N{cfg.n}_engine_breakdown.csv",
+    )
     write_metrics_csv(results, metrics_path)
     write_timeline_csv(results, timeline_path)
+    write_engine_breakdown_csv(results, breakdown_path)
     print(f"saved metrics: {metrics_path}")
     print(f"saved timeline: {timeline_path}")
+    print(f"saved engine breakdown: {breakdown_path}")
 
 
 if __name__ == "__main__":
