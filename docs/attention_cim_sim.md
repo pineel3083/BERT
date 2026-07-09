@@ -168,6 +168,7 @@ By default, outputs are saved to:
 ```text
 outputs/attention_cim_sim_N{N}_metrics.csv
 outputs/attention_cim_sim_N{N}_timeline.csv
+outputs/attention_cim_sim_N{N}_engine_breakdown.csv
 ```
 
 You can override paths:
@@ -176,7 +177,8 @@ You can override paths:
 python attention_cim_sim.py \
   --N 2048 \
   --metrics-csv results/hw_av_metrics_N2048.csv \
-  --timeline-csv results/hw_av_timeline_N2048.csv
+  --timeline-csv results/hw_av_timeline_N2048.csv \
+  --breakdown-csv results/hw_av_engine_breakdown_N2048.csv
 ```
 
 ## Caveats
