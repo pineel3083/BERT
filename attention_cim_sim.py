@@ -42,6 +42,7 @@ class SimConfig:
     av_compute_cycles: int = 1
     vgen_cycles: int = 1
     replicate_v: bool = True
+    v_replication_bandwidth: int = 4
     output_dir: str = "outputs"
     x_reuse_count: Optional[float] = None
 
@@ -286,9 +287,18 @@ def schedule_hiva_resource_matched(cfg: SimConfig) -> SimResult:
         for v_block in range(cfg.v_blocks):
             label = v_block_label(cfg, v_block)
             start = max(qkg_time, ready[v_block])
-            for engine_idx in qkg:
-                timeline.schedule(engine_idx, start, cfg.write_v_cycles, "WRITE_V", f"{label} replicated write")
-            compute_start = start + cfg.write_v_cycles
+            write_cursor = start
+            for copy_base in range(0, len(qkg), cfg.v_replication_bandwidth):
+                for engine_idx in qkg[copy_base : copy_base + cfg.v_replication_bandwidth]:
+                    timeline.schedule(
+                        engine_idx,
+                        write_cursor,
+                        cfg.write_v_cycles,
+                        "WRITE_V",
+                        f"{label} replicated write",
+                    )
+                write_cursor += cfg.write_v_cycles
+            compute_start = write_cursor
             for row_base in range(0, cfg.row_blocks, len(qkg)):
                 for lane, engine_idx in enumerate(qkg):
                     row = row_base + lane
@@ -438,6 +448,7 @@ def build_result(case: str, cfg: SimConfig, timeline: Timeline) -> SimResult:
         "v_data_reuse_count": float(cfg.row_blocks),
         "a_data_reuse_count": float(cfg.output_blocks),
         "x_data_reuse_count": float(x_reuse),
+        "v_replication_bandwidth": float(cfg.v_replication_bandwidth),
     }
     return SimResult(case=case, config=cfg, timeline=timeline, metrics=metrics)
 
@@ -532,6 +543,7 @@ def write_metrics_csv(results: Sequence[SimResult], path: str) -> None:
         "write_x_cycles",
         "av_compute_cycles",
         "vgen_cycles",
+        "v_replication_bandwidth",
     ]
     metric_keys = list(results[0].metrics.keys())
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -553,6 +565,7 @@ def write_metrics_csv(results: Sequence[SimResult], path: str) -> None:
                 "write_x_cycles": result.config.write_x_cycles,
                 "av_compute_cycles": result.config.av_compute_cycles,
                 "vgen_cycles": result.config.vgen_cycles,
+                "v_replication_bandwidth": result.config.v_replication_bandwidth,
             }
             row.update(result.metrics)
             writer.writerow(row)
@@ -604,6 +617,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--av-compute-cycles", type=positive_int, default=1)
     parser.add_argument("--vgen-cycles", type=positive_int, default=1)
     parser.add_argument("--replicate-v", type=parse_bool, default=True)
+    parser.add_argument(
+        "--v-replication-bandwidth",
+        type=int,
+        default=4,
+        help=(
+            "number of QKG engines that can receive replicated V writes in the same "
+            "write_v_cycles interval; 4 keeps the original ideal-broadcast upper bound"
+        ),
+    )
     parser.add_argument("--x-reuse-count", type=float, default=None)
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--metrics-csv", default=None)
@@ -614,6 +636,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.v_replication_bandwidth < 1:
+        raise ValueError("--v-replication-bandwidth must be >= 1")
     cfg = SimConfig(
         n=args.N,
         d=args.D,
@@ -629,6 +653,7 @@ def main() -> None:
         av_compute_cycles=args.av_compute_cycles,
         vgen_cycles=args.vgen_cycles,
         replicate_v=args.replicate_v,
+        v_replication_bandwidth=args.v_replication_bandwidth,
         output_dir=args.output_dir,
         x_reuse_count=args.x_reuse_count,
     )
