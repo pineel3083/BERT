@@ -163,12 +163,49 @@ Run resource-matched HIVA without V replication:
 python attention_cim_sim.py --N 2048 --replicate-v false
 ```
 
+Run the replicated-HIVA upper/lower bounds directly:
+
+```bash
+python attention_cim_sim.py --N 2048 --v-replication-bandwidth 1
+python attention_cim_sim.py --N 2048 --v-replication-bandwidth 2
+python attention_cim_sim.py --N 2048 --v-replication-bandwidth 4
+```
+
+Sweep V replication bandwidth:
+
+```bash
+python sweep_attention_cim_sim.py \
+  --N-list 1024 2048 4096 \
+  --v-replication-bandwidth-list 1 2 4
+```
+
+Interpretation:
+
+```text
+v_replication_bandwidth = 1: one QKG engine receives V per write interval
+v_replication_bandwidth = 2: two QKG engines receive V per write interval
+v_replication_bandwidth = 4: ideal 4-way replicated V write upper bound
+```
+
+Sweep latency ranges:
+
+```bash
+python sweep_attention_cim_sim.py \
+  --N-list 1024 2048 4096 \
+  --v-replication-bandwidth-list 1 2 4 \
+  --write-a-cycles-list 1 2 \
+  --write-v-cycles-list 1 2 4 \
+  --vgen-cycles-list 1 2 \
+  --av-compute-cycles-list 1
+```
+
 By default, outputs are saved to:
 
 ```text
 outputs/attention_cim_sim_N{N}_metrics.csv
 outputs/attention_cim_sim_N{N}_timeline.csv
 outputs/attention_cim_sim_N{N}_engine_breakdown.csv
+outputs/attention_cim_param_sweep.csv
 ```
 
 You can override paths:
