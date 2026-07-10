@@ -10,50 +10,56 @@ except Exception:
     EncoderDecoderCache = None
 
 
+TCS_THRESHOLD_ORDER = "lsb_to_msb"
+TCS_ACTIVE_RULE = "bsum > threshold"
+
+
+def _zero_tcs_stats(enable_tcs=False, tcs_thresholds=None):
+    return {
+        "enable_tcs": enable_tcs,
+        "tcs_thresholds": tcs_thresholds,
+        "tcs_threshold_order": TCS_THRESHOLD_ORDER,
+        "tcs_active_rule": TCS_ACTIVE_RULE,
+        "bit_ops_total": 0,
+        "bit_ops_skipped_by_tcs": 0,
+        "tcs_rows_total": 0,
+        "tcs_rows_skipped": 0,
+        "tcs_row_skip_ratio": 0.0,
+    }
+
+
 def prepare_tpdcim_attention_mask(attention_mask, query):
     """
-    HF BERT에서 넘어오는 attention_mask를
-    attention score에 더할 수 있는 additive mask로 변환한다.
+    Convert HF BERT masks into additive attention-score masks.
 
-    입력 가능 형태:
+    Supported inputs:
         [B, N]          : 1=keep, 0=mask
-        [B, 1, 1, N]    : 이미 확장된 mask
-        [B, 1, N, N]    : 이미 확장된 mask
+        [B, 1, 1, N]    : already expanded
+        [B, 1, N, N]    : already expanded
 
-    출력:
-        [B, 1, 1, N] 또는 [B, 1, N, N]
-        keep 위치: 0
-        mask 위치: -10000
+    Output values:
+        keep position: 0
+        masked position: -10000
     """
     if attention_mask is None:
         return None
 
     mask = attention_mask.to(device=query.device)
 
-    # 이미 additive mask인 경우
-    # 보통 keep=0, masked=-10000 또는 매우 작은 음수
+    # Already additive: keep=0, masked=-10000 or another large negative value.
     if mask.dtype.is_floating_point:
         if mask.numel() > 0 and mask.min().item() < 0:
             return mask.to(dtype=query.dtype)
 
-    # 여기부터는 1/0 mask라고 가정
-    # 1 = keep, 0 = mask
     mask = mask.to(dtype=query.dtype)
-
     additive_mask = (1.0 - mask) * -10000.0
 
     if additive_mask.dim() == 2:
-        # [B, N] -> [B, 1, 1, N]
         additive_mask = additive_mask[:, None, None, :]
-
     elif additive_mask.dim() == 3:
-        # [B, N, N] -> [B, 1, N, N]
         additive_mask = additive_mask[:, None, :, :]
-
     elif additive_mask.dim() == 4:
-        # 이미 broadcast 가능한 형태
         pass
-
     else:
         raise ValueError(
             f"Unsupported attention_mask shape: {attention_mask.shape}"
@@ -61,52 +67,6 @@ def prepare_tpdcim_attention_mask(attention_mask, query):
 
     return additive_mask
 
-# def qkt_tiled_fp32(query, key, scaling, tile_n=256):
-#     """
-#     query: [B, H, N, D]
-#     key:   [B, H, N, D]
-
-#     return:
-#         scores: [B, H, N, N]
-
-#     원래:
-#         scores = query @ key.transpose(-1, -2)
-
-#     변경:
-#         Q, K를 token tile 단위로 잘라서
-#         scores[:, :, q0:q1, k0:k1] = Q_tile @ K_tile.T
-#     """
-#     B, H, N, D = query.shape
-
-#     scores = query.new_empty(B, H, N, N)
-
-#     computed_tiles = 0
-
-#     for q0 in range(0, N, tile_n):
-#         q1 = min(q0 + tile_n, N)
-#         q_tile = query[:, :, q0:q1, :]  # [B, H, Tq, D]
-
-#         for k0 in range(0, N, tile_n):
-#             k1 = min(k0 + tile_n, N)
-#             k_tile = key[:, :, k0:k1, :]  # [B, H, Tk, D]
-
-#             scores[:, :, q0:q1, k0:k1] = torch.matmul(
-#                 q_tile,
-#                 k_tile.transpose(2, 3),
-#             )
-
-#             computed_tiles += 1
-
-#     scores = scores * scaling
-
-#     stats = {
-#         "N": N,
-#         "D": D,
-#         "tile_n": tile_n,
-#         "computed_qk_tiles": computed_tiles,
-#     }
-
-#     return scores, stats
 
 def make_sparse_block_mask(
     num_blocks,
@@ -116,33 +76,39 @@ def make_sparse_block_mask(
     device=None,
 ):
     """
-    block-level sparse attention mask.
+    BigBird-like block-level sparse attention mask.
 
-    mask[qi, kj] = True  -> Q block qi가 K block kj를 계산
-    mask[qi, kj] = False -> 계산 skip
+    mask[qi, kj] = True  -> compute Q block qi against K block kj
+    mask[qi, kj] = False -> skip that QK tile in the hardware-stat model
     """
     mask = torch.zeros(num_blocks, num_blocks, dtype=torch.bool, device=device)
 
-    # 1. local window
-    # 예: local_window=1이면 i-1, i, i+1 block 계산
     for qi in range(num_blocks):
         k0 = max(0, qi - local_window)
         k1 = min(num_blocks, qi + local_window + 1)
         mask[qi, k0:k1] = True
 
-    # 2. global block
-    # 예: block 0은 모든 block과 연결
     for g in global_blocks:
         if 0 <= g < num_blocks:
             mask[g, :] = True
             mask[:, g] = True
 
-    # 3. deterministic random block
-    # 매번 랜덤이면 결과가 바뀌니까 고정 패턴 사용
-    for qi in range(num_blocks):
-        for r in range(num_random_blocks):
-            kj = (qi * 1103515245 + 12345 + r * 97) % num_blocks
-            mask[qi, kj] = True
+    # Deterministic pseudo-random extra blocks keep evaluation reproducible.
+    # Already-enabled local/global tiles are skipped so the option actually adds
+    # distinct sparse connectivity when enough off-mask blocks exist.
+    random_blocks = max(0, int(num_random_blocks))
+    if random_blocks:
+        for qi in range(num_blocks):
+            added = 0
+            attempts = 0
+            start = (qi * 1103515245 + 12345) % max(1, num_blocks)
+            while added < random_blocks and attempts < num_blocks:
+                kj = (start + attempts) % num_blocks
+                attempts += 1
+                if bool(mask[qi, kj]):
+                    continue
+                mask[qi, kj] = True
+                added += 1
 
     return mask
 
@@ -158,15 +124,11 @@ def qkt_tiled_fp32(
     num_random_blocks=0,
 ):
     """
-    query: [B, H, N, D]
-    key:   [B, H, N, D]
+    FP32 QK^T tile simulation.
 
-    dense mode:
-        모든 Q/K block 계산
-
-    sparse mode:
-        block_mask=True인 block만 계산
-        나머지 score는 -inf 유지
+    query/key shape: [B, H, N, D]
+    dense mode computes all block tiles; sparse mode computes only block_mask=True
+    tiles and leaves skipped tiles at -inf before softmax.
     """
     B, H, N, D = query.shape
     num_blocks = (N + tile_n - 1) // tile_n
@@ -179,8 +141,6 @@ def qkt_tiled_fp32(
             num_random_blocks=num_random_blocks,
             device=query.device,
         )
-
-        # sparse에서 계산하지 않는 곳은 softmax 후 0이 되어야 하므로 -inf
         scores = query.new_full((B, H, N, N), float("-inf"))
     else:
         block_mask = torch.ones(num_blocks, num_blocks, dtype=torch.bool, device=query.device)
@@ -192,8 +152,7 @@ def qkt_tiled_fp32(
     for qi in range(num_blocks):
         q0 = qi * tile_n
         q1 = min(q0 + tile_n, N)
-
-        q_tile = query[:, :, q0:q1, :]  # [B, H, Tq, D]
+        q_tile = query[:, :, q0:q1, :]
 
         for kj in range(num_blocks):
             if not bool(block_mask[qi, kj]):
@@ -202,40 +161,44 @@ def qkt_tiled_fp32(
 
             k0 = kj * tile_n
             k1 = min(k0 + tile_n, N)
-
-            k_tile = key[:, :, k0:k1, :]  # [B, H, Tk, D]
+            k_tile = key[:, :, k0:k1, :]
 
             scores[:, :, q0:q1, k0:k1] = torch.matmul(
                 q_tile,
                 k_tile.transpose(2, 3),
             )
-
             computed_tiles += 1
 
     scores = scores * scaling
+    total_tiles = num_blocks * num_blocks
 
     stats = {
         "N": N,
         "D": D,
         "tile_n": tile_n,
         "num_blocks": num_blocks,
+        "local_window": local_window,
+        "global_blocks": list(global_blocks),
+        "num_random_blocks": int(num_random_blocks),
+        "qk_mode": "fp32",
+        "quantization": "none",
         "enable_sparse": enable_sparse,
         "computed_qk_tiles": computed_tiles,
         "skipped_qk_tiles": skipped_tiles,
-        "total_qk_tiles": num_blocks * num_blocks,
-        "sparse_density": computed_tiles / (num_blocks * num_blocks),
+        "total_qk_tiles": total_tiles,
+        "sparse_density": computed_tiles / total_tiles,
     }
+    stats.update(_zero_tcs_stats())
 
     return scores, stats
 
+
 def quantize_symmetric_int8(x, eps=1e-8):
     """
-    symmetric INT8 quantization.
+    Symmetric INT8 quantization.
 
-    x_fp32 ≈ x_int8 * scale
-    x_int8 range: -127 ~ 127
-
-    여기서는 per-tile scale 하나를 사용한다.
+    x_fp32 ~= x_int8 * scale, with x_int8 in [-127, 127]. This simulation uses
+    one scale per tile to keep INT8 and bit-serial paths directly comparable.
     """
     max_abs = x.detach().abs().amax()
     scale = torch.clamp(max_abs / 127.0, min=eps)
@@ -259,18 +222,7 @@ def qkt_tiled_int8(
     global_blocks=(0,),
     num_random_blocks=0,
 ):
-    """
-    INT8 simulated QK tiling.
-
-    query: [B, H, N, D]
-    key:   [B, H, N, D]
-
-    각 Q/K tile을 INT8로 quantize한 뒤:
-        Q_int8 @ K_int8.T
-    를 수행하고 다시 float score로 dequantize한다.
-
-    아직 bit-serial/TCS는 아님.
-    """
+    """INT8 simulated QK^T tiling without bit-serial decomposition."""
     B, H, N, D = query.shape
     num_blocks = (N + tile_n - 1) // tile_n
 
@@ -282,7 +234,6 @@ def qkt_tiled_int8(
             num_random_blocks=num_random_blocks,
             device=query.device,
         )
-
         scores = query.new_full((B, H, N, N), float("-inf"))
     else:
         block_mask = torch.ones(
@@ -291,7 +242,6 @@ def qkt_tiled_int8(
             dtype=torch.bool,
             device=query.device,
         )
-
         scores = query.new_empty(B, H, N, N)
 
     computed_tiles = 0
@@ -300,8 +250,7 @@ def qkt_tiled_int8(
     for qi in range(num_blocks):
         q0 = qi * tile_n
         q1 = min(q0 + tile_n, N)
-
-        q_tile = query[:, :, q0:q1, :]  # [B, H, Tq, D]
+        q_tile = query[:, :, q0:q1, :]
         q_int8, q_scale = quantize_symmetric_int8(q_tile)
 
         for kj in range(num_blocks):
@@ -311,41 +260,42 @@ def qkt_tiled_int8(
 
             k0 = kj * tile_n
             k1 = min(k0 + tile_n, N)
-
-            k_tile = key[:, :, k0:k1, :]  # [B, H, Tk, D]
+            k_tile = key[:, :, k0:k1, :]
             k_int8, k_scale = quantize_symmetric_int8(k_tile)
 
-            # PyTorch CUDA에서 int8 matmul 지원이 제한적일 수 있어서
-            # functional simulation은 float matmul로 수행.
-            # 값 자체는 INT8로 quantized된 값이다.
+            # PyTorch may not support the desired INT8 matmul on every device, so
+            # this is a functional simulation over quantized integer values.
             score_int_like = torch.matmul(
                 q_int8.to(torch.float32),
                 k_int8.to(torch.float32).transpose(2, 3),
             )
-
             score_fp = score_int_like.to(query.dtype) * (q_scale * k_scale)
-
             scores[:, :, q0:q1, k0:k1] = score_fp
-
             computed_tiles += 1
 
     scores = scores * scaling
+    total_tiles = num_blocks * num_blocks
 
     stats = {
         "N": N,
         "D": D,
         "tile_n": tile_n,
         "num_blocks": num_blocks,
+        "local_window": local_window,
+        "global_blocks": list(global_blocks),
+        "num_random_blocks": int(num_random_blocks),
         "qk_mode": "int8",
         "quantization": "per_tile_symmetric_int8",
         "enable_sparse": enable_sparse,
         "computed_qk_tiles": computed_tiles,
         "skipped_qk_tiles": skipped_tiles,
-        "total_qk_tiles": num_blocks * num_blocks,
-        "sparse_density": computed_tiles / (num_blocks * num_blocks),
+        "total_qk_tiles": total_tiles,
+        "sparse_density": computed_tiles / total_tiles,
     }
+    stats.update(_zero_tcs_stats())
 
     return scores, stats
+
 
 def qkt_tiled_bitserial(
     query,
@@ -359,11 +309,21 @@ def qkt_tiled_bitserial(
     enable_tcs=False,
     tcs_thresholds=None,
 ):
+    """
+    Reconstruct INT8 QK^T using bit-serial Q input planes.
+
+    TCS convention is intentionally unchanged from the current experiments:
+    thresholds are interpreted LSB->MSB, and rows are active when
+    bsum > threshold. Rows with bsum <= threshold are zeroed in the hardware
+    activity model before the bit-plane matmul.
+    """
     B, H, N, D = query.shape
     num_blocks = (N + tile_n - 1) // tile_n
 
     if tcs_thresholds is None:
         tcs_thresholds = [0] * 8
+    if len(tcs_thresholds) != 8:
+        raise ValueError("tcs_thresholds must contain 8 values in LSB-to-MSB order")
 
     if enable_sparse:
         block_mask = make_sparse_block_mask(
@@ -386,7 +346,6 @@ def qkt_tiled_bitserial(
     computed_tiles = 0
     skipped_tiles = 0
     bit_ops_total = 0
-
     bit_ops_skipped_by_tcs = 0
     tcs_rows_total = 0
     tcs_rows_skipped = 0
@@ -394,10 +353,8 @@ def qkt_tiled_bitserial(
     for qi in range(num_blocks):
         q0 = qi * tile_n
         q1 = min(q0 + tile_n, N)
-
         q_tile = query[:, :, q0:q1, :]
         q_int8, q_scale = quantize_symmetric_int8(q_tile)
-
         q_uint8 = torch.bitwise_and(q_int8.to(torch.int16), 255)
 
         for kj in range(num_blocks):
@@ -407,10 +364,8 @@ def qkt_tiled_bitserial(
 
             k0 = kj * tile_n
             k1 = min(k0 + tile_n, N)
-
             k_tile = key[:, :, k0:k1, :]
             k_int8, k_scale = quantize_symmetric_int8(k_tile)
-
             k_fp = k_int8.to(torch.float32)
 
             acc = torch.zeros(
@@ -427,62 +382,56 @@ def qkt_tiled_bitserial(
                     1,
                 ).to(torch.float32)
 
-                # TCS: row마다 bit input의 1 개수 계산
-                # q_bit shape: [B, H, Tq, D]
-                # bsum shape : [B, H, Tq]
+                # Hardware proxy: sum the 64 bit-serial inputs per row. This is
+                # activity/energy accounting, not a CUDA speedup claim.
                 bsum = q_bit.sum(dim=-1)
 
                 if enable_tcs:
                     threshold = tcs_thresholds[bit]
-
-                    # bsum > threshold 인 row만 계산 유지
                     active_row = bsum > threshold
 
                     tcs_rows_total += active_row.numel()
                     tcs_rows_skipped += active_row.numel() - active_row.sum().item()
 
-                    # 전부 inactive면 이 bit-plane matmul 자체 skip
                     if not bool(active_row.any()):
                         bit_ops_skipped_by_tcs += 1
                         continue
 
-                    # inactive row는 q_bit를 0으로 만들어 결과 기여 제거
                     q_bit = q_bit * active_row.unsqueeze(-1).to(q_bit.dtype)
 
-                if bit < 7:
-                    bit_weight = float(1 << bit)
-                else:
-                    bit_weight = -128.0
-
+                bit_weight = float(1 << bit) if bit < 7 else -128.0
                 partial = torch.matmul(
                     q_bit,
                     k_fp.transpose(2, 3),
                 )
-
                 acc = acc + bit_weight * partial
 
             score_fp = acc.to(query.dtype) * (q_scale * k_scale)
             scores[:, :, q0:q1, k0:k1] = score_fp
-
             computed_tiles += 1
 
     scores = scores * scaling
+    total_tiles = num_blocks * num_blocks
 
     stats = {
         "N": N,
         "D": D,
         "tile_n": tile_n,
         "num_blocks": num_blocks,
+        "local_window": local_window,
+        "global_blocks": list(global_blocks),
+        "num_random_blocks": int(num_random_blocks),
         "qk_mode": "bitserial",
         "quantization": "per_tile_symmetric_int8",
         "enable_sparse": enable_sparse,
         "computed_qk_tiles": computed_tiles,
         "skipped_qk_tiles": skipped_tiles,
-        "total_qk_tiles": num_blocks * num_blocks,
-        "sparse_density": computed_tiles / (num_blocks * num_blocks),
-        "bit_ops_total": bit_ops_total,
+        "total_qk_tiles": total_tiles,
+        "sparse_density": computed_tiles / total_tiles,
         "enable_tcs": enable_tcs,
         "tcs_thresholds": tcs_thresholds,
+        "tcs_threshold_order": TCS_THRESHOLD_ORDER,
+        "tcs_active_rule": TCS_ACTIVE_RULE,
         "bit_ops_total": bit_ops_total,
         "bit_ops_skipped_by_tcs": bit_ops_skipped_by_tcs,
         "tcs_rows_total": tcs_rows_total,
@@ -493,6 +442,7 @@ def qkt_tiled_bitserial(
     }
 
     return scores, stats
+
 
 def tpdcim_eager_attention_forward(
     module,
@@ -505,18 +455,13 @@ def tpdcim_eager_attention_forward(
     **kwargs,
 ):
     """
-    기존 eager_attention_forward를 흉내 내되,
-    QK^T 부분만 tiled version으로 바꾼 함수.
-
-    query/key/value:
-        [B, H, N, D]
+    HF eager attention equivalent with only QK^T replaced by TP-DCIM stats paths.
+    AV remains functionally unchanged: attn_weights @ value.
     """
-
     use_qk_tiling = getattr(module, "tpdcim_enable_qk_tiling", False)
 
     if use_qk_tiling:
         tile_n = getattr(module, "tpdcim_tile_n", 256)
-
         qk_mode = getattr(module, "tpdcim_qk_mode", "fp32")
 
         common_kwargs = dict(
@@ -532,45 +477,39 @@ def tpdcim_eager_attention_forward(
 
         if qk_mode == "fp32":
             attn_weights, stats = qkt_tiled_fp32(**common_kwargs)
-            stats["qk_mode"] = "fp32"
         elif qk_mode == "int8":
             attn_weights, stats = qkt_tiled_int8(**common_kwargs)
-            stats["qk_mode"] = "int8"
         elif qk_mode == "bitserial":
             attn_weights, stats = qkt_tiled_bitserial(
                 **common_kwargs,
                 enable_tcs=getattr(module, "tpdcim_enable_tcs", False),
                 tcs_thresholds=getattr(module, "tpdcim_tcs_thresholds", None),
             )
-            stats["qk_mode"] = "bitserial"
         else:
             raise ValueError(f"Unsupported tpdcim_qk_mode: {qk_mode}")
         module.tpdcim_last_stats = stats
-
     else:
         attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
         module.tpdcim_last_stats = None
 
-    attention_mask = prepare_tpdcim_attention_mask(
-        attention_mask,
-        query,
-    )
-
+    attention_mask = prepare_tpdcim_attention_mask(attention_mask, query)
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask
 
     attn_weights = F.softmax(attn_weights, dim=-1)
-
     attn_weights = F.dropout(
         attn_weights,
         p=dropout,
         training=module.training,
     )
 
-    # A × V는 아직 원본 방식 유지
-    attn_output = torch.matmul(attn_weights, value)
+    head_mask = kwargs.get("head_mask", None)
+    if head_mask is not None:
+        attn_weights = attn_weights * head_mask
 
-    # [B, H, N, D] -> [B, N, H, D]
+    # AV is intentionally left exact/unchanged for now. A-stationary AV should be
+    # added later as a stats-only utilization model unless functional tiling is needed.
+    attn_output = torch.matmul(attn_weights, value)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
@@ -584,15 +523,10 @@ def patched_bert_self_attention_forward(
     past_key_values=None,
     **kwargs,
 ):
-    """
-    Hugging Face BertSelfAttention.forward를 instance 단위로 patch하는 함수.
+    """Instance-level BertSelfAttention.forward patch."""
+    if past_key_values is None and "past_key_value" in kwargs:
+        past_key_values = kwargs.pop("past_key_value")
 
-    원본과 같은 흐름:
-        hidden_states
-        -> Q/K/V projection
-        -> attention
-        -> attn_output reshape
-    """
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.attention_head_size)
 
@@ -602,7 +536,6 @@ def patched_bert_self_attention_forward(
 
     if past_key_values is not None:
         current_past_key_values = past_key_values
-
         if EncoderDecoderCache is not None and isinstance(past_key_values, EncoderDecoderCache):
             current_past_key_values = past_key_values.self_attention_cache
 
@@ -625,29 +558,8 @@ def patched_bert_self_attention_forward(
     )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-
     return attn_output, attn_weights
 
-
-# def enable_qk_tiling(model, tile_n=256):
-#     """
-#     Hugging Face BertForMaskedLM / BertModel 안의 모든 BertSelfAttention에
-#     QK tiling patch를 적용한다.
-#     """
-#     if hasattr(model, "bert"):
-#         layers = model.bert.encoder.layer
-#     else:
-#         layers = model.encoder.layer
-
-#     for layer in layers:
-#         attn = layer.attention.self
-
-#         attn.tpdcim_enable_qk_tiling = True
-#         attn.tpdcim_tile_n = tile_n
-#         attn.tpdcim_last_stats = None
-
-#         # 이 instance의 forward만 우리가 만든 함수로 교체
-#         attn.forward = types.MethodType(patched_bert_self_attention_forward, attn)
 
 def enable_qk_tiling(
     model,
@@ -660,10 +572,12 @@ def enable_qk_tiling(
     enable_tcs=False,
     tcs_thresholds=None,
 ):
-    """
-    모든 BertSelfAttention에 QK tiling patch 적용.
-    sparse 옵션도 여기서 같이 설정.
-    """
+    """Patch all BertSelfAttention modules with TP-DCIM QK simulation settings."""
+    if qk_mode not in ("fp32", "int8", "bitserial"):
+        raise ValueError("qk_mode must be one of: fp32, int8, bitserial")
+    if enable_tcs and tcs_thresholds is not None and len(tcs_thresholds) != 8:
+        raise ValueError("tcs_thresholds must contain 8 values in LSB-to-MSB order")
+
     if hasattr(model, "bert"):
         layers = model.bert.encoder.layer
     else:
@@ -674,32 +588,21 @@ def enable_qk_tiling(
 
         attn.tpdcim_enable_qk_tiling = True
         attn.tpdcim_tile_n = tile_n
-
         attn.tpdcim_enable_sparse = enable_sparse
         attn.tpdcim_local_window = local_window
         attn.tpdcim_global_blocks = global_blocks
-        attn.tpdcim_num_random_blocks = num_random_blocks
-        attn.tpdcim_qk_mode = qk_mode # For qk quantization
-        attn.tpdcim_last_stats = None
-
-        attn.tpdcim_enable_sparse = enable_sparse
-        attn.tpdcim_local_window = local_window
-        attn.tpdcim_global_blocks = global_blocks
-        attn.tpdcim_num_random_blocks = num_random_blocks
-
+        attn.tpdcim_num_random_blocks = int(num_random_blocks)
+        attn.tpdcim_qk_mode = qk_mode
         attn.tpdcim_enable_tcs = enable_tcs
         attn.tpdcim_tcs_thresholds = tcs_thresholds
-
-        # forward patch
+        attn.tpdcim_tcs_threshold_order = TCS_THRESHOLD_ORDER
+        attn.tpdcim_tcs_active_rule = TCS_ACTIVE_RULE
+        attn.tpdcim_last_stats = None
         attn.forward = types.MethodType(patched_bert_self_attention_forward, attn)
 
 
-
 def disable_qk_tiling(model):
-    """
-    이미 patch된 forward를 원복하는 함수는 아님.
-    단순히 tiling flag만 끈다.
-    """
+    """Disable QK tiling flags without attempting to restore original bound methods."""
     if hasattr(model, "bert"):
         layers = model.bert.encoder.layer
     else:
@@ -708,3 +611,4 @@ def disable_qk_tiling(model):
     for layer in layers:
         attn = layer.attention.self
         attn.tpdcim_enable_qk_tiling = False
+        attn.tpdcim_last_stats = None
